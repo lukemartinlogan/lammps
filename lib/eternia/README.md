@@ -109,14 +109,21 @@ Instead each block takes a chunk of *i*-atoms - exactly one page of positions
 - and walks that chunk's neighbour entries, which the host flattening has
 made one contiguous range. For each page of that range:
 
-1. **Pass A** records, in a shared bitmap, which position pages those entries
-   refer to.
+1. **Pass A** records, in a per-block bitmap, which position pages those
+   entries refer to.
 2. **Pass B** holds each recorded page once, block-collectively, and lets
    every thread evaluate the pairs of its own atom that land in that page.
 
 Pass B rescans the entries once per touched page, which is only a good trade
 because the touched set is small - and that is exactly the spatial sorting
 requirement above.
+
+That bitmap, and the staged tile of i-atom positions, live in **global**
+per-block scratch rather than in shared memory. This is not a performance
+choice: a `co_await` can exit the kernel and have the driver relaunch the
+block, so nothing in dynamic shared memory survives a page fault. Only the
+final reductions use shared, where no `co_await` runs between the write and
+the read.
 
 Each step begins by dropping the block's caches. The host rewrites positions
 into the CTE every step and nothing invalidates the device's resident pages,
