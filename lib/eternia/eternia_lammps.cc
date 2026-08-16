@@ -90,9 +90,11 @@ constexpr u64 kPosStride = 4;
 constexpr u32 kPageBitmapBits = 2048;
 constexpr u32 kPageBitmapWords = kPageBitmapBits / 32;
 
+#if !CTP_IS_DEVICE_PASS
 std::string g_last_error;
 
 void SetError(const char *what) { g_last_error = what; }
+#endif
 
 #if defined(CLIO_YIELD_CORO)
 constexpr u32 kYieldLaneBytes = 4096;
@@ -123,6 +125,15 @@ struct LJParams {
   int ntypes_p1 = 0;
 };
 
+/**
+ * HOST ONLY. clang compiles this file TWICE -- once for the host and once for
+ * the device -- and gv::Vector, the CTE Client and the yield driver are all
+ * declared behind `#if !CTP_IS_DEVICE_PASS`, because none of them can exist on
+ * a device. Without this guard the device pass reports every one of them as an
+ * unknown name, in a couple of hundred errors that read like a broken
+ * toolchain rather than like a missing #if.
+ */
+#if !CTP_IS_DEVICE_PASS
 struct Context {
   Config cfg;
   int nall = 0;
@@ -147,6 +158,7 @@ struct Context {
   double energy = 0.0;
   Stats stats;
 };
+#endif  // !CTP_IS_DEVICE_PASS
 
 #if defined(ETERNIA_LMP_CORO)
 
@@ -417,6 +429,7 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
                                energy_out));
 }
 
+#if !CTP_IS_DEVICE_PASS
 /** Drives the yieldable kernel to completion, relaunching after each park. */
 class YieldRunner {
  public:
@@ -437,12 +450,15 @@ class YieldRunner {
   gy::Yieldable<> drv_;
   gy::YieldStack stack_;
 };
+#endif  // !CTP_IS_DEVICE_PASS
 
 #endif  // ETERNIA_LMP_CORO
 
 // ---------------------------------------------------------------------------
-// Host API
+// Host API. Entirely inside the host pass: it calls into the CTE client and
+// the yield driver, neither of which exists on the device side.
 // ---------------------------------------------------------------------------
+#if !CTP_IS_DEVICE_PASS
 
 bool Available() {
 #if defined(ETERNIA_LMP_CORO)
@@ -829,6 +845,8 @@ void ResetStats(Context *ctx) {
   (void)ctx;
 #endif
 }
+
+#endif  // !CTP_IS_DEVICE_PASS
 
 }  // namespace eternia_lammps
 

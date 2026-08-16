@@ -30,6 +30,16 @@ if(NOT iowarp-core_DIR)
     "-Diowarp-core_DIR=<clio-install>/lib/cmake/iowarp-core")
 endif()
 
+# The Clio install prefix, derived from iowarp-core_DIR
+# (<prefix>/lib/cmake/iowarp-core -> <prefix>), plus whatever the user already
+# has. Passed to the sub-build with | as the list separator, because a ; would
+# be eaten by the CMAKE_ARGS list itself.
+get_filename_component(ETERNIA_CLIO_PREFIX "${iowarp-core_DIR}/../../.." ABSOLUTE)
+set(ETERNIA_PREFIX_PATH "${ETERNIA_CLIO_PREFIX}")
+foreach(_p IN LISTS CMAKE_PREFIX_PATH)
+  string(APPEND ETERNIA_PREFIX_PATH "|${_p}")
+endforeach()
+
 include(ExternalProject)
 
 set(ETERNIA_BINARY_DIR ${CMAKE_BINARY_DIR}/eternia-build)
@@ -45,7 +55,13 @@ ExternalProject_Add(eternia_build
     -DCMAKE_CUDA_COMPILER=${ETERNIA_CUDA_COMPILER}
     -DCMAKE_CUDA_ARCHITECTURES=${ETERNIA_CUDA_ARCHITECTURES}
     -Diowarp-core_DIR=${iowarp-core_DIR}
+    # iowarp-core's package config include()s its component configs, which
+    # find_dependency() each other by name -- so the install prefix has to be
+    # on CMAKE_PREFIX_PATH as well, not just iowarp-core_DIR. Without it the
+    # configure fails on "Could not find clio_run".
+    "-DCMAKE_PREFIX_PATH=${ETERNIA_PREFIX_PATH}"
     -DETERNIA_ENABLE=ON
+  LIST_SEPARATOR |
   BUILD_BYPRODUCTS ${ETERNIA_INSTALL_DIR}/lib/liblammps_eternia.a
 )
 
@@ -57,6 +73,14 @@ add_dependencies(LAMMPS::eternia eternia_build)
 
 # The backend pulls in the Clio client libraries and the CUDA runtime, and
 # those are resolved in the LAMMPS link line, not inside the static archive.
+#
+# Same two workarounds as lib/eternia/CMakeLists.txt, for the same reasons:
+# the Clio prefix must be on CMAKE_PREFIX_PATH for the component configs to
+# find each other, and nvcomp/yaml-cpp must already be imported because
+# iowarp-core names them in its link interfaces without finding them itself.
+list(APPEND CMAKE_PREFIX_PATH "${ETERNIA_CLIO_PREFIX}")
+find_package(nvcomp QUIET CONFIG)
+find_package(yaml-cpp QUIET CONFIG)
 find_package(iowarp-core REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
