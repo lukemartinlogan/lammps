@@ -75,6 +75,18 @@ struct Stats {
   std::uint64_t f_puts = 0;
   std::uint64_t f_put_errors = 0;
   std::uint64_t get_errors = 0;
+
+  /** Neighbour entries the kernel actually examined, and the number it should
+   *  have. Every entry belongs to exactly one position page, so these must be
+   *  equal -- a shortfall means pairs were silently skipped, which shows up
+   *  in the energy as a small deficit rather than as an error. */
+  std::uint64_t pairs_seen = 0;
+  std::uint64_t pairs_expected = 0;
+  /** Diagnostics: entries whose type read back as 0 (a page-cache miss shows
+   *  up this way, because the padding beyond the atom count is zero), and
+   *  entries rejected by the cutoff. */
+  std::uint64_t pairs_badtype = 0;
+  std::uint64_t pairs_cut = 0;
 };
 
 /** Opaque handle; the definition lives in the clang-compiled TU. */

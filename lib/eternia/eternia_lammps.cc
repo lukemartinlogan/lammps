@@ -112,6 +112,19 @@ constexpr u32 kPageBitmapWords = kPageBitmapBits / 32;
  */
 constexpr u32 kTileAtoms = 512;
 
+/**
+ * Per-block GLOBAL scratch: page bitmap, min/max range, staged i-atom tile.
+ *
+ * Global rather than shared because every one of these must survive a
+ * co_await -- see the note at the top of PairLJCutCoro.
+ */
+CTP_INLINE_CROSS_FUN clio::run::u64 ScratchBytesPerBlock() {
+  return static_cast<clio::run::u64>(kPageBitmapWords) * sizeof(clio::run::u32) +
+         2 * sizeof(clio::run::u64) +
+         static_cast<clio::run::u64>(kTileAtoms) * 3 * sizeof(float) +
+         static_cast<clio::run::u64>(kTileAtoms) * sizeof(int);
+}
+
 #if !CTP_IS_DEVICE_PASS
 std::string g_last_error;
 
@@ -160,6 +173,8 @@ struct Context {
   Config cfg;
   int nall = 0;
   int inum = 0;
+  /** offset[inum] -- how many neighbour entries the kernel MUST examine. */
+  std::uint64_t total_entries = 0;
 
   gv::Vector<float> *x = nullptr;
   gv::Vector<int> *type = nullptr;
@@ -177,6 +192,8 @@ struct Context {
   float *d_lj_pool = nullptr;   // one allocation backing all six lj arrays
   double *d_energy = nullptr;
   double *d_virial = nullptr;
+  unsigned long long *d_pairs = nullptr;
+  char *d_scratch = nullptr;
 
   double energy = 0.0;
   double virial[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
@@ -223,7 +240,9 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
                                        const int *offset, const int *ilist,
                                        int inum, LJParams lj, u64 atoms_per_page,
                                        u32 nblocks, u32 block, int eflag,
-                                       double *energy_out, double *virial_out) {
+                                       double *energy_out, double *virial_out,
+                                       unsigned long long *pairs_out,
+                                       char *scratch) {
   extern __shared__ char smem_raw[];
   // Shared layout, packed by hand because the sizes are runtime values:
   //   [0]                     page bitmap        kPageBitmapWords u32
@@ -237,11 +256,25 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
   // CLIO_YIELD_SMEM_BYTES of the dynamic shared block; starting the bitmap
   // there overwrites it, and the block then behaves as though it had already
   // finished -- no faults, no work, no error.
-  u32 *touched = reinterpret_cast<u32 *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+  // ONLY the final reductions live in shared memory. Everything that has to
+  // survive a page fault lives in GLOBAL per-block scratch, because a
+  // co_await can EXIT THE KERNEL and have the driver relaunch this block --
+  // at which point the dynamic shared block is whatever the new launch got.
+  //
+  // Keeping the staged tile and the page bitmap in shared was a real bug, and
+  // a quiet one: it did not crash, it produced answers that were nearly right
+  // and DIFFERENT ON EVERY RUN, with an error that tracked page size and
+  // block count because those decide how often a fault actually suspends.
+  // The same binary gave E_pair = -6.7733676, -6.605114 and -6.3337926 on
+  // three runs of one input.
+  //
+  // The reductions below are safe in shared: no co_await runs inside them.
+  double *epart = reinterpret_cast<double *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
+
+  char *sc = scratch + static_cast<u64>(block) * ScratchBytesPerBlock();
+  u32 *touched = reinterpret_cast<u32 *>(sc);
   u64 *range = reinterpret_cast<u64 *>(touched + kPageBitmapWords);
-  double *epart = reinterpret_cast<double *>(range + 2);
-  // The staged i-atom tile: positions then types.
-  float *tile_x = reinterpret_cast<float *>(epart + blockDim.x);
+  float *tile_x = reinterpret_cast<float *>(range + 2);
   int *tile_t = reinterpret_cast<int *>(tile_x + 3 * kTileAtoms);
 
   u64 run = 0;
@@ -254,6 +287,9 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
   // get nothing. Falling back to fdotr therefore reported a pressure that was
   // wrong rather than missing (kinetic term only, virial silently zero).
   double v_local[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  unsigned long long n_pairs = 0;
+  unsigned long long n_badtype = 0;   // itype or jtype read back as 0
+  unsigned long long n_cut = 0;       // rejected by the cutoff test
 
   // DROP THE BLOCK'S CACHES BEFORE READING ANYTHING.
   //
@@ -437,13 +473,21 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
             for (u64 k = s; k < e; ++k) {
               const u64 j = static_cast<u64>(neigh.at(k));
               if (AtomPage(x, j) != pg) continue;   // another hold's business
+              // Every neighbour entry belongs to EXACTLY ONE position page,
+              // so across all pg iterations this must count each entry once.
+              // Comparing the total against the host's sum(numneigh) turns
+              // "the energy is a bit low" into "N entries were never
+              // examined", which is the difference between guessing and
+              // knowing.
+              ++n_pairs;
               const float delx = xtmp - xn.at(j * kPosStride + 0);
               const float dely = ytmp - xn.at(j * kPosStride + 1);
               const float delz = ztmp - xn.at(j * kPosStride + 2);
               const int jtype = tn.at(j);
               const float rsq = delx * delx + dely * dely + delz * delz;
               const int c = itype * lj.ntypes_p1 + jtype;
-              if (rsq >= lj.cutsq[c]) continue;
+              if (itype == 0 || jtype == 0) ++n_badtype;
+              if (rsq >= lj.cutsq[c]) { ++n_cut; continue; }
 
               const float r2inv = 1.0f / rsq;
               const float r6inv = r2inv * r2inv * r2inv;
@@ -511,6 +555,10 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
     __syncthreads();
   }
 
+  atomicAdd(&pairs_out[0], n_pairs);
+  atomicAdd(&pairs_out[1], n_badtype);
+  atomicAdd(&pairs_out[2], n_cut);
+
   // Every force page must be durable before the host reads it: the puts were
   // only issued above.
   co_await FlushWaitCoro(f);
@@ -524,6 +572,7 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
                                 const int *ilist, int inum, LJParams lj,
                                 u64 atoms_per_page, u32 nblocks, int eflag,
                                 double *energy_out, double *virial_out,
+                                unsigned long long *pairs_out, char *scratch,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -538,7 +587,7 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
   __syncthreads();
   CLIO_YCORO_RUN(PairLJCutCoro(x, type, neigh, f, offset, ilist, inum, lj,
                                atoms_per_page, nblocks, yv.Block(), eflag,
-                               energy_out, virial_out));
+                               energy_out, virial_out, pairs_out, scratch));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -687,7 +736,11 @@ Context *Create(const Config &cfg, int nall) {
     }
   }
   if (cudaMalloc(&ctx->d_energy, sizeof(double)) != cudaSuccess ||
-      cudaMalloc(&ctx->d_virial, 6 * sizeof(double)) != cudaSuccess) {
+      cudaMalloc(&ctx->d_virial, 6 * sizeof(double)) != cudaSuccess ||
+      cudaMalloc(&ctx->d_pairs, 3 * sizeof(unsigned long long)) != cudaSuccess ||
+      cudaMalloc(&ctx->d_scratch,
+                 static_cast<size_t>(cfg.nblocks) * ScratchBytesPerBlock()) !=
+          cudaSuccess) {
     SetError("cudaMalloc(energy/virial) failed");
     Destroy(ctx);
     return nullptr;
@@ -708,6 +761,8 @@ void Destroy(Context *ctx) {
   if (ctx->d_lj_pool) cudaFree(ctx->d_lj_pool);
   if (ctx->d_energy) cudaFree(ctx->d_energy);
   if (ctx->d_virial) cudaFree(ctx->d_virial);
+  if (ctx->d_pairs) cudaFree(ctx->d_pairs);
+  if (ctx->d_scratch) cudaFree(ctx->d_scratch);
 #endif
   delete ctx;
 }
@@ -797,6 +852,7 @@ void UploadNeighbors(Context *ctx, const int *ilist, const int *numneigh,
     off[ii + 1] = off[ii] + numneigh[ilist[ii]];
   }
   const u64 total = static_cast<u64>(off[inum]);
+  ctx->total_entries = total;
 
   const u64 page_elems = ctx->cfg.page_bytes / sizeof(int);
   delete ctx->neigh;
@@ -916,15 +972,14 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
   cudaMemset(ctx->d_energy, 0, sizeof(double));
   cudaMemset(ctx->d_virial, 0, 6 * sizeof(double));
+  cudaMemset(ctx->d_pairs, 0, 3 * sizeof(unsigned long long));
 
   const u64 atoms_per_page =
       (ctx->cfg.page_bytes / sizeof(float)) / kPosStride;
-  // Must match the hand-packed layout at the top of PairLJCutCoro, in order:
-  // yield state, page bitmap, min/max range, per-thread energy, i-atom tile.
-  const size_t smem = CLIO_YIELD_SMEM_BYTES +
-                      kPageBitmapWords * sizeof(u32) + 2 * sizeof(u64) +
-                      ctx->cfg.nthreads * sizeof(double) +
-                      kTileAtoms * (3 * sizeof(float) + sizeof(int));
+  // Shared holds ONLY the reduction scratch now; everything that must
+  // survive a fault moved to d_scratch in global memory.
+  const size_t smem =
+      CLIO_YIELD_SMEM_BYTES + ctx->cfg.nthreads * sizeof(double);
 
   auto xd = ctx->x->GetDevice(ctx->cfg.gpu_id);
   auto td = ctx->type->GetDevice(ctx->cfg.gpu_id);
@@ -938,7 +993,7 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
                                         ctx->d_ilist, ctx->inum, ctx->lj,
                                         atoms_per_page, ctx->cfg.nblocks,
                                         eflag, ctx->d_energy, ctx->d_virial,
-                                        vw, sv);
+                                        ctx->d_pairs, ctx->d_scratch, vw, sv);
       });
   // Check the LAUNCH, not just the sync. A bad launch configuration (too much
   // shared memory, too many threads) is reported by cudaGetLastError and can
@@ -964,6 +1019,13 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
              cudaMemcpyDeviceToHost);
   cudaMemcpy(ctx->virial, ctx->d_virial, 6 * sizeof(double),
              cudaMemcpyDeviceToHost);
+  unsigned long long pc[3] = {0, 0, 0};
+  cudaMemcpy(pc, ctx->d_pairs, 3 * sizeof(unsigned long long),
+             cudaMemcpyDeviceToHost);
+  ctx->stats.pairs_seen = pc[0];
+  ctx->stats.pairs_badtype = pc[1];
+  ctx->stats.pairs_cut = pc[2];
+  ctx->stats.pairs_expected = ctx->total_entries;
 
   if (ctx->cfg.stats) {
     auto sx = ctx->x->ReadStats(ctx->cfg.gpu_id);

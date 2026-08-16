@@ -195,12 +195,22 @@ void PairLJCutEternia::report_stats()
   if (comm->me == 0) {
     utils::logmesg(lmp,
                    "eternia step {}: x faults {} evicts {} | neigh faults {} | "
-                   "f puts {} (errors {}) | get errors {}\n",
+                   "f puts {} (errors {}) | get errors {} | pairs {}/{} badtype {} cut {}\n",
                    update->ntimestep, s.x_faults, s.x_evicts, s.neigh_faults,
-                   s.f_puts, s.f_put_errors, s.get_errors);
+                   s.f_puts, s.f_put_errors, s.get_errors, s.pairs_seen,
+                   s.pairs_expected, s.pairs_badtype, s.pairs_cut);
   }
   // A non-zero error count means pages were silently dropped: forces would be
   // wrong, not merely slow, so this is fatal rather than a warning.
+  // Every neighbour entry belongs to exactly one position page, so anything
+  // other than equality means the paged walk skipped pairs -- which the
+  // energy only reports as a small deficit.
+  if (s.pairs_seen != s.pairs_expected)
+    error->all(FLERR,
+               "pair_style lj/cut/eternia: the kernel examined {} neighbour "
+               "entries but the list holds {} -- pairs were skipped",
+               s.pairs_seen, s.pairs_expected);
+
   if (s.f_put_errors || s.get_errors)
     error->all(FLERR,
                "pair_style lj/cut/eternia: {} failed page writebacks and {} "

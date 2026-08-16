@@ -127,17 +127,31 @@ per-step re-upload.
 
 ## Verification
 
-Against stock `lj/cut` on a 2048-atom FCC melt (`newton off`, same seed), the
-paged path reproduces the reference trajectory to 7-8 significant figures on
-energy, total energy and pressure - the agreement expected from narrowing
-positions to single precision:
+Against stock `lj/cut` on FCC melts (`newton off`, same seed), the paged path
+reproduces the reference to 7-8 significant figures on energy, total energy
+and pressure - the agreement expected from narrowing positions to single
+precision.
 
-| step | quantity | `lj/cut/eternia` | `lj/cut`    |
-|------|----------|------------------|-------------|
-| 0    | E_pair   | -6.7733676       | -6.7733681  |
-| 0    | Press    | -3.7039546       | -3.7039539  |
-| 10   | E_pair   | -5.4352541       | -5.4352540  |
-| 10   | Press    |  2.4371429       |  2.4371428  |
+Correctness is checked ACROSS CONFIGURATIONS, not in one. A single matching
+run means very little here: the kernel's behaviour depends on how often a
+page fault actually suspends it, so page size, block count and cache size
+each change the code path. Every cell below gives E_pair = -6.7733676
+against a stock reference of -6.7733681, and every one accounts for all
+neighbour entries:
+
+| atoms | page  | blocks | slots | note                    |
+|-------|-------|--------|-------|-------------------------|
+| 16384 | 64KB  | 4      | 64    | 4 chunks, 4 blocks      |
+| 16384 | 64KB  | 1      | 64    | 4 chunks, 1 block       |
+| 16384 | 256KB | 1      | 64    | 1 chunk, 32 tiles       |
+| 2048  | 4KB   | 1      | 64    | many small pages        |
+| 2048  | 4KB   | 8      | 64    | many pages, many blocks |
+| 2048  | 4KB   | 8      | 3     | cache far smaller than the working set: heavy eviction |
+
+The kernel also counts the neighbour entries it actually examines and
+compares them against the host's `sum(numneigh)`; a mismatch is fatal. That
+check exists because the failure mode here is not a crash - it is an energy
+that is a fraction of a percent low, which no eye catches.
 
 ## Not yet done
 
