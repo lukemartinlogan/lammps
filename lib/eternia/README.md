@@ -160,6 +160,35 @@ compares them against the host's `sum(numneigh)`; a mismatch is fatal. That
 check exists because the failure mode here is not a crash - it is an energy
 that is a fraction of a percent low, which no eye catches.
 
+## Larger than VRAM
+
+The point of the exercise, on an 8 GiB (7.99 GiB usable) RTX 4070 Laptop.
+An FCC lattice has a size-independent energy per atom, so every row below is
+checked against the same reference, and every row accounts for all of its
+neighbour entries:
+
+| cells | atoms      | entries       | data     | E_pair     | `run 0` |
+|-------|------------|---------------|----------|------------|---------|
+| 16    | 16,384     | 1,277,952     | 0.01 GiB | -6.7733676 | 6 s     |
+| 32    | 131,072    | 10,223,616    | 0.04 GiB | -6.7733676 | 4 s     |
+| 64    | 1,048,576  | 81,788,928    | 0.34 GiB | -6.7733676 | 8 s     |
+| 96    | 3,538,944  | 276,037,632   | 1.15 GiB | -6.7733666 | 14 s    |
+| 160   | 16,384,000 | 1,277,952,000 | 5.31 GiB | -6.7733677 | 53 s    |
+| 184   | 24,918,016 | 1,943,605,248 | **8.08 GiB** | -6.7733681 | 81 s |
+
+Stock `lj/cut` gives -6.7733681. The last row holds more data than the GPU
+has memory, and the run pages it: 69,068 position faults and 68,044
+evictions in a single force evaluation. The GPU-side cache is
+`blocks * slots * page` = 64 * 16 * 256 KB = 256 MB of positions, i.e. about
+3% of the dataset.
+
+**The current ceiling is 2^31 neighbour entries**, not memory. At 24.9M atoms
+the list already holds 1.94e9 entries - 90% of INT_MAX - because the device
+offset table is 32-bit. That is under 1.2x of headroom above the largest
+system that exceeds this machine's VRAM, so on a larger GPU the offset table
+has to widen to 64 bits before the memory limit is reached. Exceeding it is
+now a clean error rather than a silent wrap.
+
 ## Not yet done
 
 - **Multi-rank.** Each rank would need its own tag prefix and GPU; the pair

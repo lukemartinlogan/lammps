@@ -846,12 +846,27 @@ void UploadNeighbors(Context *ctx, const int *ilist, const int *numneigh,
     }
   }
 
-  std::vector<int> off(static_cast<size_t>(inum) + 1);
-  off[0] = 0;
+  // 64-bit while summing, because this is the number that overflows first.
+  // A 25M-atom run already reaches 1.94e9 entries -- 90% of INT_MAX -- so the
+  // headroom above the largest system that fits this machine's VRAM is under
+  // a factor of 1.2. Overflowing would not fail: it would wrap the offsets
+  // and index the neighbour vector somewhere else entirely.
+  std::vector<u64> off64(static_cast<size_t>(inum) + 1);
+  off64[0] = 0;
   for (int ii = 0; ii < inum; ++ii) {
-    off[ii + 1] = off[ii] + numneigh[ilist[ii]];
+    off64[ii + 1] = off64[ii] + static_cast<u64>(numneigh[ilist[ii]]);
   }
-  const u64 total = static_cast<u64>(off[inum]);
+  const u64 total = off64[inum];
+  if (total > static_cast<u64>(0x7FFFFFFF)) {
+    SetError("neighbour list has more than 2^31 entries; the device offset "
+             "table is 32-bit and would wrap. Reduce the atom count or the "
+             "cutoff, or widen the offset table to 64 bits");
+    return;
+  }
+  std::vector<int> off(static_cast<size_t>(inum) + 1);
+  for (int ii = 0; ii <= inum; ++ii) {
+    off[ii] = static_cast<int>(off64[ii]);
+  }
   ctx->total_entries = total;
 
   const u64 page_elems = ctx->cfg.page_bytes / sizeof(int);
