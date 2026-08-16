@@ -63,6 +63,11 @@ ExternalProject_Add(eternia_build
     -DETERNIA_ENABLE=ON
   LIST_SEPARATOR |
   BUILD_BYPRODUCTS ${ETERNIA_INSTALL_DIR}/lib/liblammps_eternia.a
+  # Without this, ExternalProject stamps the build as done once and NEVER
+  # reruns it -- editing the kernel then relinks LAMMPS against the previous
+  # archive and reports success. The sub-build is one translation unit, so
+  # always descending into it costs a no-op ninja invocation.
+  BUILD_ALWAYS ON
 )
 
 add_library(LAMMPS::eternia STATIC IMPORTED)

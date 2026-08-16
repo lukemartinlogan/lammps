@@ -145,6 +145,17 @@ void DownloadForces(Context *ctx, double *const *f, int nall);
 /** Potential energy accumulated by the last ComputeLJCut. */
 double GetEnergy(Context *ctx);
 
+/**
+ * Global virial from the last ComputeLJCut, in LAMMPS order
+ * (xx, yy, zz, xy, xz, yz).
+ *
+ * Computed per pair on the device rather than left to LAMMPS's
+ * virial_fdotr_compute(): fdotr sums x.f over local AND ghost atoms, and a
+ * full list with newton off gives ghosts no force at all, so the fallback
+ * reported a pressure that was wrong rather than absent.
+ */
+void GetVirial(Context *ctx, double *out6);
+
 Stats GetStats(Context *ctx);
 void ResetStats(Context *ctx);
 

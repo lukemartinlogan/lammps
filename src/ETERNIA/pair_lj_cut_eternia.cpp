@@ -48,7 +48,7 @@ PairLJCutEternia::~PairLJCutEternia()
 
 void PairLJCutEternia::settings(int narg, char **arg)
 {
-  if (narg < 1) error->all(FLERR, "Illegal pair_style lj/cut/eternia command");
+  if (narg < 1) utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia", error);
 
   // Cutoff handling is entirely PairLJCut's; only the first argument belongs
   // to it, so the keywords are stripped off before delegating.
@@ -58,27 +58,33 @@ void PairLJCutEternia::settings(int narg, char **arg)
   int iarg = 1;
   while (iarg < narg) {
     if (strcmp(arg[iarg], "page") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style command: page");
+      if (iarg + 2 > narg)
+        utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia page", error);
       cfg.page_bytes = utils::bnumeric(FLERR, arg[iarg + 1], false, lmp) * 1024;
       iarg += 2;
     } else if (strcmp(arg[iarg], "blocks") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style command: blocks");
+      if (iarg + 2 > narg)
+        utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia blocks", error);
       cfg.nblocks = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg], "threads") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style command: threads");
+      if (iarg + 2 > narg)
+        utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia threads", error);
       cfg.nthreads = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg], "slots") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style command: slots");
+      if (iarg + 2 > narg)
+        utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia slots", error);
       cfg.slots_x = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg], "tag") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style command: tag");
+      if (iarg + 2 > narg)
+        utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia tag", error);
       cfg.tag_prefix = arg[iarg + 1];
       iarg += 2;
     } else if (strcmp(arg[iarg], "stats") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style command: stats");
+      if (iarg + 2 > narg)
+        utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia stats", error);
       cfg.stats = (strcmp(arg[iarg + 1], "on") == 0);
       iarg += 2;
     } else {
@@ -168,10 +174,15 @@ void PairLJCutEternia::compute(int eflag, int vflag)
 
   if (eflag_global) eng_vdwl += eternia_lammps::GetEnergy(ctx);
 
-  // The virial is not computed on the device yet, so ask LAMMPS for the
-  // global fdotr form rather than reporting zero pressure -- which would be
-  // wrong quietly, in a way an NPT run would not survive.
-  if (vflag_fdotr) virial_fdotr_compute();
+  // The virial comes back from the kernel, computed per pair. It must NOT be
+  // left to virial_fdotr_compute(): that sums x.f over local and ghost atoms,
+  // and a full list with newton off gives ghosts no force, so fdotr here
+  // silently reported the kinetic term alone.
+  if (vflag_global) {
+    double v[6];
+    eternia_lammps::GetVirial(ctx, v);
+    for (int k = 0; k < 6; k++) virial[k] += v[k];
+  }
 
   if (cfg.stats) report_stats();
 }

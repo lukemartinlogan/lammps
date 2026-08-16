@@ -2004,3 +2004,7 @@
 /pair_bondval.h
 /pair_bondval_vec.cpp
 /pair_bondval_vec.h
+
+/pair_lj_cut_eternia.cpp
+/pair_lj_cut_eternia.h
+/eternia_lammps.h

@@ -1,13 +1,20 @@
 # 3d Lennard-Jones melt, with positions / types / neighbours / forces held
 # out of core in the Clio CTE and paged into the GPU by the force kernel.
 #
-# Run the Clio daemon first; this connects to it as a client.
+# The Clio runtime starts in process, but needs a server configuration:
+#
+#   CLIO_SERVER_CONF=clio.yaml ../../build/lmp -in in.melt.eternia
 #
 # Compare against examples/melt/in.melt, which is the same system with the
 # stock pair_style lj/cut.
 
 units           lj
 atom_style      atomic
+
+# REQUIRED, and it must come BEFORE the box is defined: LAMMPS rejects a
+# newton change after that point. A half list would need each pair's force
+# written to atom j, which lives in another block's page cache.
+newton          off
 
 lattice         fcc 0.8442
 region          box block 0 40 0 40 0 40
@@ -16,10 +23,6 @@ create_atoms    1 box
 mass            1 1.0
 
 velocity        all create 3.0 87287 loop geom
-
-# REQUIRED: a half list would need each pair's force written to atom j, which
-# lives in another block's page cache. See lib/eternia/README.md.
-newton          off
 
 # STRONGLY RECOMMENDED: a page holds a contiguous range of atom indices, so
 # paging only pays off when spatial and index locality agree.

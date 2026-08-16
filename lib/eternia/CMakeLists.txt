@@ -92,7 +92,25 @@ if(ETERNIA_ENABLE)
       clio::cte::core_client
       ctp::cudacxx
       CUDA::cudart)
-  set_target_properties(lammps_eternia PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+  # SEPARABLE COMPILATION OFF, deliberately, and iowarp-core makes the same
+  # choice for the same reason (see CLIO_CUDA_SEPARABLE in
+  # cmake/ClioCoreCommon.cmake).
+  #
+  # Separable compilation leaves RELOCATABLE device code in the object file,
+  # which needs a device-link step before the kernel is registered with the
+  # CUDA runtime -- and LAMMPS links this library with an ordinary C++
+  # compiler, which does no such step. The result is a binary that builds and
+  # runs but whose every launch fails with "invalid resource handle": no
+  # kernel executes, no page is faulted, and every force comes back zero.
+  # Letting CMake do the device link instead is not an option either, because
+  # under clang-CUDA it drives fatbinary with pre-CUDA-13 options
+  # ("fatbinary fatal: Unknown option 'im'").
+  #
+  # Off is correct rather than merely expedient: every device callee here
+  # lives in a header (gpu_vector and the yield machinery are header-only), so
+  # this translation unit's fatbin is already self-contained.
+  set_target_properties(lammps_eternia PROPERTIES
+      CUDA_SEPARABLE_COMPILATION OFF)
 else()
   # Stub: the same API, every entry point reporting why it is unavailable, so
   # `pair_style lj/cut/eternia` fails with a sentence instead of a link error.
@@ -100,5 +118,7 @@ else()
   target_include_directories(lammps_eternia PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
-install(TARGETS lammps_eternia ARCHIVE DESTINATION lib)
+install(TARGETS lammps_eternia
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib)
 install(FILES eternia_lammps.h DESTINATION include)

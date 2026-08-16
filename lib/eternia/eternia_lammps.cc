@@ -154,9 +154,17 @@ struct Context {
   LJParams lj;
   float *d_lj_pool = nullptr;   // one allocation backing all six lj arrays
   double *d_energy = nullptr;
+  double *d_virial = nullptr;
 
   double energy = 0.0;
+  double virial[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   Stats stats;
+
+  /** False when the last UploadNeighbors rejected the list. Without it a
+   *  rejected upload would leave inum at 0 and the kernel would sail through
+   *  computing nothing -- the same silent-zero failure the probe-only scan
+   *  produced. */
+  bool state_valid = false;
 };
 #endif  // !CTP_IS_DEVICE_PASS
 
@@ -193,7 +201,7 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
                                        const int *offset, const int *ilist,
                                        int inum, LJParams lj, u64 atoms_per_page,
                                        u32 nblocks, u32 block, int eflag,
-                                       double *energy_out) {
+                                       double *energy_out, double *virial_out) {
   extern __shared__ char smem_raw[];
   // Shared layout, packed by hand because the sizes are runtime values:
   //   [0]                     page bitmap        kPageBitmapWords u32
@@ -202,12 +210,48 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
   // The i-atom positions are NOT cached in shared: they are already in the
   // held x page, and re-reading them from there costs one indexed load while
   // a shared copy would cost atoms_per_page*4 floats the block does not have.
-  u32 *touched = reinterpret_cast<u32 *>(smem_raw);
+  // PAST the yield machinery's own shared memory, not at offset 0. The
+  // coroutine driver keeps its per-block state in the first
+  // CLIO_YIELD_SMEM_BYTES of the dynamic shared block; starting the bitmap
+  // there overwrites it, and the block then behaves as though it had already
+  // finished -- no faults, no work, no error.
+  u32 *touched = reinterpret_cast<u32 *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
   u64 *range = reinterpret_cast<u64 *>(touched + kPageBitmapWords);
   double *epart = reinterpret_cast<double *>(range + 2);
 
   u64 run = 0;
   double e_local = 0.0;
+  // Per-pair virial, accumulated here rather than left to LAMMPS's
+  // virial_fdotr_compute(). fdotr sums x.f over local AND ghost atoms, so it
+  // is only correct when ghosts carry their share of the force -- which is
+  // exactly what a full list with newton off does NOT produce: every atom's
+  // force is complete, but only for the atoms this kernel owns, and ghosts
+  // get nothing. Falling back to fdotr therefore reported a pressure that was
+  // wrong rather than missing (kinetic term only, virial silently zero).
+  double v_local[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+  // DROP THE BLOCK'S CACHES BEFORE READING ANYTHING.
+  //
+  // The host rewrites positions, types and the neighbour list into the CTE on
+  // every step, but nothing tells the device page cache that the bytes behind
+  // its resident pages have changed -- the cache is private to the block and
+  // there is no invalidation protocol. Without this the kernel keeps serving
+  // step 0's pages for the whole run: the paging counters showed "x faults 2"
+  // on the first step and 0 on every step after, and the trajectory froze with
+  // a correct-looking energy computed from stale coordinates.
+  //
+  // This makes every step re-fault its working set, which is the honest cost
+  // of coordinates that change each step. It is also why the eventual fix is
+  // to move the integrator onto the vector so positions are updated IN the
+  // cache rather than around it.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    x.DropAll();
+    type.DropAll();
+    neigh.DropAll();
+    f.DropAll();
+  }
+  __syncthreads();
 
   const u64 npages_atoms =
       (static_cast<u64>(inum) + atoms_per_page - 1) / atoms_per_page;
@@ -240,110 +284,116 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
     }
     __syncthreads();
 
-    // ---- PASS A: which neighbour pages does this chunk touch? ----------
-    // Windowed, because the bitmap is a fixed 2048 pages: a chunk whose
-    // neighbours span more than that (unsorted atoms) is processed in
-    // several windows rather than being silently truncated.
-    if (threadIdx.x == 0) {
-      range[0] = ~0ull;   // min
-      range[1] = 0ull;    // max
-    }
-    __syncthreads();
-    {
-      u64 lo = ~0ull, hi = 0ull;
-      for (u64 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-        const int ii = static_cast<int>(a);
-        const int start = offset[ii], end = offset[ii + 1];
-        for (int k = start; k < end; ++k) {
-          // The neighbour array itself is paged. Reading it one element at a
-          // time through a hold would be a hold per neighbour, so pass A
-          // holds a RUN and walks it -- the sequential-access contract the
-          // vector is built around.
-          u64 nrun = 0;
-          const int *q = neigh.TryHoldRawConst(k, end - k, &nrun);
-          if (q == nullptr) continue;   // settled in pass A2 below
-          for (u64 t = 0; t < nrun && k + static_cast<int>(t) < end; ++t) {
-            const u64 pg = AtomPage(x, static_cast<u64>(q[t]));
-            if (pg < lo) lo = pg;
-            if (pg > hi) hi = pg;
-          }
-          k += static_cast<int>(nrun) - 1;
-        }
-      }
-      if (lo != ~0ull) {
-        atomicMin(reinterpret_cast<unsigned long long *>(&range[0]),
-                  static_cast<unsigned long long>(lo));
-        atomicMax(reinterpret_cast<unsigned long long *>(&range[1]),
-                  static_cast<unsigned long long>(hi));
-      }
-    }
-    __syncthreads();
+    // The chunk's neighbour entries occupy ONE contiguous range of the
+    // neighbour vector, [k0, k1) -- that is what the flattening in
+    // UploadNeighbors buys. So the block can walk that range page by page,
+    // faulting each page with a proper collective hold.
+    //
+    // This has to be a real hold, not a probe. An earlier version scanned the
+    // list with TryHoldRawConst, which is PROBE-ONLY: it returns null on a
+    // miss and never faults. Nothing else touched the neighbour vector, so
+    // every probe missed, the touched-page bitmap stayed empty, and the kernel
+    // computed nothing at all -- while still reporting success. The run
+    // finished with E_pair exactly 0 and zero faults, zero writebacks.
+    const u64 k0 = static_cast<u64>(offset[a0]);
+    const u64 k1 = static_cast<u64>(offset[a1]);
+    const u64 npe = neigh.h_->elems_per_page_;
 
-    const u64 pg_lo = range[0], pg_hi = range[1];
-    if (pg_lo == ~0ull) continue;   // no neighbours at all in this chunk
+    for (u64 np = (k1 > k0 ? k0 / npe : 0); k1 > k0 && np <= (k1 - 1) / npe;
+         ++np) {
+      const u64 e0 = (k0 > np * npe) ? k0 : np * npe;
+      const u64 e1 = (k1 < (np + 1) * npe) ? k1 : (np + 1) * npe;
+      if (e0 >= e1) continue;
 
-    for (u64 win = pg_lo; win <= pg_hi; win += kPageBitmapBits) {
-      const u64 win_hi = (win + kPageBitmapBits - 1 < pg_hi)
-                             ? (win + kPageBitmapBits - 1)
-                             : pg_hi;
-      for (u32 w = threadIdx.x; w < kPageBitmapWords; w += blockDim.x) {
-        touched[w] = 0u;
+      // Collective: every thread ends up with this page in its last_page_,
+      // so the scans below can read it with at().
+      co_await neigh.HoldPageCoro(e0, e1 - e0, &run);
+
+      // ---- PASS A: which position pages do THESE entries touch? --------
+      if (threadIdx.x == 0) {
+        range[0] = ~0ull;   // min
+        range[1] = 0ull;    // max
       }
       __syncthreads();
-
-      // Mark the pages this window actually contains.
-      for (u64 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-        const int ii = static_cast<int>(a);
-        const int start = offset[ii], end = offset[ii + 1];
-        for (int k = start; k < end; ++k) {
-          u64 nrun = 0;
-          const int *q = neigh.TryHoldRawConst(k, end - k, &nrun);
-          if (q == nullptr) { continue; }
-          for (u64 t = 0; t < nrun && k + static_cast<int>(t) < end; ++t) {
-            const u64 pg = AtomPage(x, static_cast<u64>(q[t]));
-            if (pg >= win && pg <= win_hi) {
-              const u32 b = static_cast<u32>(pg - win);
-              atomicOr(&touched[b >> 5], 1u << (b & 31u));
-            }
-          }
-          k += static_cast<int>(nrun) - 1;
+      {
+        u64 lo = ~0ull, hi = 0ull;
+        for (u64 k = e0 + threadIdx.x; k < e1; k += blockDim.x) {
+          const u64 pg = AtomPage(x, static_cast<u64>(neigh.at(k)));
+          if (pg < lo) lo = pg;
+          if (pg > hi) hi = pg;
+        }
+        if (lo != ~0ull) {
+          atomicMin(reinterpret_cast<unsigned long long *>(&range[0]),
+                    static_cast<unsigned long long>(lo));
+          atomicMax(reinterpret_cast<unsigned long long *>(&range[1]),
+                    static_cast<unsigned long long>(hi));
         }
       }
       __syncthreads();
 
-      // ---- PASS B: one hold per touched page, all threads compute ------
-      for (u64 pg = win; pg <= win_hi; ++pg) {
-        const u32 b = static_cast<u32>(pg - win);
-        if ((touched[b >> 5] & (1u << (b & 31u))) == 0u) continue;
+      const u64 pg_lo = range[0], pg_hi = range[1];
+      if (pg_lo == ~0ull) continue;   // no entries fell to this thread set
 
-        // A SECOND view of x, so holding the neighbour page does not
-        // dislodge the per-thread last_page_ pointing at the i-atoms. The
-        // two views share the block's page table -- this is a register-level
-        // alias, not a second cache.
-        gv::DeviceVector<float> xn = x;
-        gv::DeviceVector<int> tn = type;
-        const u64 jbase = pg * (x.h_->elems_per_page_);
-        co_await xn.HoldPageCoro(jbase, x.h_->elems_per_page_, &run);
-        co_await tn.HoldPageCoro(jbase / kPosStride,
-                                 x.h_->elems_per_page_ / kPosStride, &run);
+      // Windowed, because the bitmap is a fixed 2048 pages: entries spanning
+      // more than that (unsorted atoms) are processed in several windows
+      // rather than being silently truncated.
+      for (u64 win = pg_lo; win <= pg_hi; win += kPageBitmapBits) {
+        const u64 win_hi = (win + kPageBitmapBits - 1 < pg_hi)
+                               ? (win + kPageBitmapBits - 1)
+                               : pg_hi;
+        for (u32 w = threadIdx.x; w < kPageBitmapWords; w += blockDim.x) {
+          touched[w] = 0u;
+        }
+        __syncthreads();
 
-        for (u64 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-          const int ii = static_cast<int>(a);
-          const int i = ilist[ii];
-          const float xtmp = x.at(static_cast<u64>(i) * kPosStride + 0);
-          const float ytmp = x.at(static_cast<u64>(i) * kPosStride + 1);
-          const float ztmp = x.at(static_cast<u64>(i) * kPosStride + 2);
-          const int itype = type.at(static_cast<u64>(i));
+        for (u64 k = e0 + threadIdx.x; k < e1; k += blockDim.x) {
+          const u64 pg = AtomPage(x, static_cast<u64>(neigh.at(k)));
+          if (pg >= win && pg <= win_hi) {
+            const u32 b = static_cast<u32>(pg - win);
+            atomicOr(&touched[b >> 5], 1u << (b & 31u));
+          }
+        }
+        __syncthreads();
 
-          float fx = 0.0f, fy = 0.0f, fz = 0.0f;
-          const int start = offset[ii], end = offset[ii + 1];
-          for (int k = start; k < end; ++k) {
-            u64 nrun = 0;
-            const int *q = neigh.TryHoldRawConst(k, end - k, &nrun);
-            if (q == nullptr) continue;
-            for (u64 t = 0; t < nrun && k + static_cast<int>(t) < end; ++t) {
-              const u64 j = static_cast<u64>(q[t]);
-              if (AtomPage(x, j) != pg) continue;   // handled by another hold
+        // ---- PASS B: one hold per touched page, all threads compute ----
+        for (u64 pg = win; pg <= win_hi; ++pg) {
+          const u32 b = static_cast<u32>(pg - win);
+          if ((touched[b >> 5] & (1u << (b & 31u))) == 0u) continue;
+
+          // SECOND views of x and type, so holding the neighbour atoms' page
+          // does not dislodge the per-thread last_page_ pointing at the
+          // i-atoms. They share the block's page table -- this is a
+          // register-level alias, not a second cache -- which is also why
+          // slots_x must be >= 3: the i-page and the j-page have to be
+          // resident together, and a third slot keeps a claim from evicting
+          // one of them.
+          gv::DeviceVector<float> xn = x;
+          gv::DeviceVector<int> tn = type;
+          const u64 xpe = x.h_->elems_per_page_;
+          co_await xn.HoldPageCoro(pg * xpe, xpe, &run);
+          co_await tn.HoldPageCoro(pg * xpe / kPosStride, xpe / kPosStride,
+                                   &run);
+
+          for (u64 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
+            const int ii = static_cast<int>(a);
+            const int i = ilist[ii];
+            const float xtmp = x.at(static_cast<u64>(i) * kPosStride + 0);
+            const float ytmp = x.at(static_cast<u64>(i) * kPosStride + 1);
+            const float ztmp = x.at(static_cast<u64>(i) * kPosStride + 2);
+            const int itype = type.at(static_cast<u64>(i));
+
+            // This atom's entries, clipped to the neighbour page currently
+            // held. Both ends matter: reading outside [e0, e1) would index a
+            // page this block does not have.
+            u64 s = static_cast<u64>(offset[ii]);
+            u64 e = static_cast<u64>(offset[ii + 1]);
+            if (s < e0) s = e0;
+            if (e > e1) e = e1;
+
+            float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+            for (u64 k = s; k < e; ++k) {
+              const u64 j = static_cast<u64>(neigh.at(k));
+              if (AtomPage(x, j) != pg) continue;   // another hold's business
               const float delx = xtmp - xn.at(j * kPosStride + 0);
               const float dely = ytmp - xn.at(j * kPosStride + 1);
               const float delz = ztmp - xn.at(j * kPosStride + 2);
@@ -364,16 +414,22 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
                 e_local += 0.5 * static_cast<double>(
                     r6inv * (lj.lj3[c] * r6inv - lj.lj4[c]) - lj.offset[c]);
               }
+              // Same halving, and for the same reason.
+              v_local[0] += 0.5 * static_cast<double>(delx * delx * fpair);
+              v_local[1] += 0.5 * static_cast<double>(dely * dely * fpair);
+              v_local[2] += 0.5 * static_cast<double>(delz * delz * fpair);
+              v_local[3] += 0.5 * static_cast<double>(delx * dely * fpair);
+              v_local[4] += 0.5 * static_cast<double>(delx * delz * fpair);
+              v_local[5] += 0.5 * static_cast<double>(dely * delz * fpair);
             }
-            k += static_cast<int>(nrun) - 1;
+            // Accumulate: this hold contributes only the pairs that fell in
+            // its page, and the other holds contribute the rest.
+            f[static_cast<u64>(i) * kPosStride + 0] += fx;
+            f[static_cast<u64>(i) * kPosStride + 1] += fy;
+            f[static_cast<u64>(i) * kPosStride + 2] += fz;
           }
-          // Accumulate: this page contributes only the pairs that fell in
-          // it, and the other touched pages contribute the rest.
-          f[static_cast<u64>(i) * kPosStride + 0] += fx;
-          f[static_cast<u64>(i) * kPosStride + 1] += fy;
-          f[static_cast<u64>(i) * kPosStride + 2] += fz;
+          __syncthreads();
         }
-        __syncthreads();
       }
     }
 
@@ -400,6 +456,17 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
     }
   }
 
+  for (int vc = 0; vc < 6; ++vc) {
+    epart[threadIdx.x] = v_local[vc];
+    __syncthreads();
+    for (u32 s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+      if (threadIdx.x < s2) epart[threadIdx.x] += epart[threadIdx.x + s2];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&virial_out[vc], epart[0]);
+    __syncthreads();
+  }
+
   // Every force page must be durable before the host reads it: the puts were
   // only issued above.
   co_await FlushWaitCoro(f);
@@ -412,7 +479,8 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
                                 gv::DeviceVector<float> f, const int *offset,
                                 const int *ilist, int inum, LJParams lj,
                                 u64 atoms_per_page, u32 nblocks, int eflag,
-                                double *energy_out, gy::YieldableView<> yv,
+                                double *energy_out, double *virial_out,
+                                gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   // Each of the four vectors carries its own page table, and each must be
@@ -426,7 +494,7 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
   __syncthreads();
   CLIO_YCORO_RUN(PairLJCutCoro(x, type, neigh, f, offset, ilist, inum, lj,
                                atoms_per_page, nblocks, yv.Block(), eflag,
-                               energy_out));
+                               energy_out, virial_out));
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -485,7 +553,8 @@ bool PutPage(clio::cte::core::Client &core, const clio::cte::core::TagId &tag,
   gv::PageBlobName(page_num, name);
   auto fut = core.AsyncPutBlob(tag, std::string(name), 0, nbytes, bytes, 1.0f);
   fut.Wait();
-  return fut.get() != nullptr && fut->GetReturnCode() == 0;
+  const bool ok = fut.get() != nullptr && fut->GetReturnCode() == 0;
+  return ok;
 }
 
 bool GetPage(clio::cte::core::Client &core, const clio::cte::core::TagId &tag,
@@ -546,8 +615,36 @@ Context *Create(const Config &cfg, int nall) {
     ctx->x->EnableStats();
     ctx->f->EnableStats();
   }
-  if (cudaMalloc(&ctx->d_energy, sizeof(double)) != cudaSuccess) {
-    SetError("cudaMalloc(energy) failed");
+
+  // ZERO-FILL THE FORCE VECTOR'S BACKING STORE.
+  //
+  // Forces are write-only from the kernel's point of view, but the page cache
+  // does not know that: a hold FAULTS the page in before the kernel writes
+  // it, and a page whose blob was never created comes back as a failed get.
+  // The bytes themselves do not matter -- the kernel zeroes the chunk it
+  // holds -- but the failed read does: it leaves the slot holding whatever it
+  // held before, and it is indistinguishable from a real read failure.
+  //
+  // One pass at context creation, which happens at most once per box change.
+  {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    const u64 page_elems = cfg.page_bytes / sizeof(float);
+    const u64 npages =
+        (static_cast<u64>(nall) * kPosStride + page_elems - 1) / page_elems;
+    std::vector<float> zeros(page_elems, 0.0f);
+    for (u64 pg = 0; pg < npages; ++pg) {
+      if (!PutPage(core, ctx->f->TagId(), pg,
+                   reinterpret_cast<const char *>(zeros.data()),
+                   zeros.size() * sizeof(float))) {
+        SetError("could not initialise the force vector's backing store");
+        Destroy(ctx);
+        return nullptr;
+      }
+    }
+  }
+  if (cudaMalloc(&ctx->d_energy, sizeof(double)) != cudaSuccess ||
+      cudaMalloc(&ctx->d_virial, 6 * sizeof(double)) != cudaSuccess) {
+    SetError("cudaMalloc(energy/virial) failed");
     Destroy(ctx);
     return nullptr;
   }
@@ -566,6 +663,7 @@ void Destroy(Context *ctx) {
   if (ctx->d_ilist) cudaFree(ctx->d_ilist);
   if (ctx->d_lj_pool) cudaFree(ctx->d_lj_pool);
   if (ctx->d_energy) cudaFree(ctx->d_energy);
+  if (ctx->d_virial) cudaFree(ctx->d_virial);
 #endif
   delete ctx;
 }
@@ -625,10 +723,30 @@ void UploadNeighbors(Context *ctx, const int *ilist, const int *numneigh,
 #if defined(ETERNIA_LMP_CORO)
   if (ctx == nullptr) return;
   ctx->inum = inum;
+  ctx->state_valid = false;
 
   // Flatten LAMMPS's MyPage-backed list into one contiguous array plus an
   // offset table. The pointers themselves are not something a device can
   // chase, and the pages they point into are not contiguous.
+  // The kernel chunks i-atoms by their PAGE, and a page is a range of atom
+  // INDICES -- but the loop variable is a position in the ilist. Those two
+  // only coincide when ilist[ii] == ii, and if they diverge the block holds
+  // the page for index range [a0,a1) and then reads atoms from somewhere
+  // else entirely: wrong forces, no error.
+  //
+  // In practice they do coincide (a full list over the local atoms is built
+  // in index order, and atom_modify sort physically reorders atoms), so this
+  // is a precondition to CHECK rather than a case to handle.
+  for (int ii = 0; ii < inum; ++ii) {
+    if (ilist[ii] != ii) {
+      SetError("neighbour list is not in atom-index order (ilist[ii] != ii); "
+               "the paged kernel chunks atoms by page and cannot honour a "
+               "permuted list");
+      ctx->state_valid = false;
+      return;
+    }
+  }
+
   std::vector<int> off(static_cast<size_t>(inum) + 1);
   off[0] = 0;
   for (int ii = 0; ii < inum; ++ii) {
@@ -690,6 +808,7 @@ void UploadNeighbors(Context *ctx, const int *ilist, const int *numneigh,
              cudaMemcpyHostToDevice);
   cudaMemcpy(ctx->d_ilist, ilist, static_cast<size_t>(inum) * sizeof(int),
              cudaMemcpyHostToDevice);
+  ctx->state_valid = true;
 #else
   (void)ctx; (void)ilist; (void)numneigh; (void)firstneigh; (void)inum;
 #endif
@@ -733,7 +852,10 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
   SetError("Eternia backend not compiled in");
   return false;
 #else
-  if (ctx == nullptr || ctx->neigh == nullptr) {
+  if (ctx == nullptr || ctx->neigh == nullptr || !ctx->state_valid) {
+    if (ctx != nullptr && ctx->neigh != nullptr && !ctx->state_valid) {
+      return false;   // UploadNeighbors already set the reason
+    }
     SetError("ComputeLJCut: no neighbour list uploaded");
     return false;
   }
@@ -749,6 +871,7 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
 
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
   cudaMemset(ctx->d_energy, 0, sizeof(double));
+  cudaMemset(ctx->d_virial, 0, 6 * sizeof(double));
 
   const u64 atoms_per_page =
       (ctx->cfg.page_bytes / sizeof(float)) / kPosStride;
@@ -767,8 +890,18 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
         PairLJCutKernel<<<g, b, smem>>>(gpu, xd, td, nd, fd, ctx->d_offset,
                                         ctx->d_ilist, ctx->inum, ctx->lj,
                                         atoms_per_page, ctx->cfg.nblocks,
-                                        eflag, ctx->d_energy, vw, sv);
+                                        eflag, ctx->d_energy, ctx->d_virial,
+                                        vw, sv);
       });
+  // Check the LAUNCH, not just the sync. A bad launch configuration (too much
+  // shared memory, too many threads) is reported by cudaGetLastError and can
+  // leave cudaDeviceSynchronize returning success -- so the kernel never runs,
+  // no page is ever faulted, and every force comes back zero with no error.
+  const cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    SetError(cudaGetErrorString(launch_err));
+    return false;
+  }
   if (cudaDeviceSynchronize() != cudaSuccess) {
     SetError(cudaGetErrorString(cudaGetLastError()));
     return false;
@@ -781,6 +914,8 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
     return false;
   }
   cudaMemcpy(&ctx->energy, ctx->d_energy, sizeof(double),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(ctx->virial, ctx->d_virial, 6 * sizeof(double),
              cudaMemcpyDeviceToHost);
 
   if (ctx->cfg.stats) {
@@ -832,6 +967,10 @@ void DownloadForces(Context *ctx, double *const *f, int nall) {
 
 double GetEnergy(Context *ctx) { return ctx ? ctx->energy : 0.0; }
 
+void GetVirial(Context *ctx, double *out6) {
+  for (int i = 0; i < 6; ++i) out6[i] = ctx ? ctx->virial[i] : 0.0;
+}
+
 Stats GetStats(Context *ctx) { return ctx ? ctx->stats : Stats(); }
 
 void ResetStats(Context *ctx) {
@@ -876,6 +1015,9 @@ void SetLJParams(Context *, const double *, const double *, const double *,
 bool ComputeLJCut(Context *, int, int) { return false; }
 void DownloadForces(Context *, double *const *, int) {}
 double GetEnergy(Context *) { return 0.0; }
+void GetVirial(Context *, double *out6) {
+  for (int i = 0; i < 6; ++i) out6[i] = 0.0;
+}
 Stats GetStats(Context *) { return Stats(); }
 void ResetStats(Context *) {}
 
