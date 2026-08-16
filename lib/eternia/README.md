@@ -182,6 +182,29 @@ evictions in a single force evaluation. The GPU-side cache is
 `blocks * slots * page` = 64 * 16 * 256 KB = 256 MB of positions, i.e. about
 3% of the dataset.
 
+### A real simulation, not one force evaluation
+
+The table above is `run 0` -- a single force evaluation. That does not
+exercise reneighbouring, atom sorting, or the per-step cache drop, so it is
+not evidence that a simulation works. A 10-step MD run at the same 24.9M
+atoms / 8.08 GiB, reneighbouring every 5 steps, against stock `lj/cut` on
+CPU with the identical input:
+
+| step | quantity | `lj/cut/eternia` | `lj/cut`   |
+|------|----------|------------------|------------|
+| 0    | E_pair   | -6.7733681       | -6.7733681 |
+| 0    | Press    | -3.7027173       | -3.7027173 |
+| 5    | E_pair   | -6.5490781       | -6.5490781 |
+| 5    | Press    | -2.4556949       | -2.4556948 |
+| 10   | E_pair   | -5.4355148       | -5.4355150 |
+| 10   | TotEng   | -2.2772363       | -2.2772364 |
+| 10   | Press    |  2.4443952       |  2.4443949 |
+
+Temperature agrees to all printed digits at every step. 556 s for the 10
+steps, and every step accounts for all of its neighbour entries
+(1,943,605,248 at step 0; 1,901,186,392 after the list is rebuilt) with zero
+failed reads or writebacks.
+
 **The current ceiling is 2^31 neighbour entries**, not memory. At 24.9M atoms
 the list already holds 1.94e9 entries - 90% of INT_MAX - because the device
 offset table is 32-bit. That is under 1.2x of headroom above the largest
