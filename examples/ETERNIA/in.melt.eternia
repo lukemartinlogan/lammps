@@ -1,0 +1,37 @@
+# 3d Lennard-Jones melt, with positions / types / neighbours / forces held
+# out of core in the Clio CTE and paged into the GPU by the force kernel.
+#
+# Run the Clio daemon first; this connects to it as a client.
+#
+# Compare against examples/melt/in.melt, which is the same system with the
+# stock pair_style lj/cut.
+
+units           lj
+atom_style      atomic
+
+lattice         fcc 0.8442
+region          box block 0 40 0 40 0 40
+create_box      1 box
+create_atoms    1 box
+mass            1 1.0
+
+velocity        all create 3.0 87287 loop geom
+
+# REQUIRED: a half list would need each pair's force written to atom j, which
+# lives in another block's page cache. See lib/eternia/README.md.
+newton          off
+
+# STRONGLY RECOMMENDED: a page holds a contiguous range of atom indices, so
+# paging only pays off when spatial and index locality agree.
+atom_modify     sort 1000 2.0
+
+pair_style      lj/cut/eternia 2.5 page 256 blocks 64 threads 256 slots 16 stats on
+pair_coeff      1 1 1.0 1.0 2.5
+
+neighbor        0.3 bin
+neigh_modify    every 20 delay 0 check no
+
+fix             1 all nve
+
+thermo          50
+run             250
