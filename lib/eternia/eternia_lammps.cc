@@ -90,6 +90,28 @@ constexpr u64 kPosStride = 4;
 constexpr u32 kPageBitmapBits = 2048;
 constexpr u32 kPageBitmapWords = kPageBitmapBits / 32;
 
+/**
+ * i-atoms staged in shared memory at a time.
+ *
+ * The i-atoms' positions and types are COPIED OUT of the page cache before
+ * the neighbour loop runs, and every later read comes from shared memory.
+ * That is a correctness requirement, not an optimisation: the i-page and the
+ * j-pages live in the SAME per-block page table, so holding a j-page can
+ * evict the i-page, after which the per-thread last_page_ still points at
+ * that slot -- now refilled with some other page. Reading atom i through it
+ * then yields another page's bytes.
+ *
+ * The symptom is not subtle once eviction actually happens: two atoms appear
+ * to sit at the same coordinates, r6inv explodes, and the run reports
+ * E_pair = inf with Press = nan. It stayed hidden for as long as the cache
+ * was big enough to hold everything at once (32 slots, 2 pages), which is
+ * exactly the regime that is NOT the point of an out-of-core vector.
+ *
+ * 512 atoms * (3 floats + 1 int) = 8 KB of the 48 KB shared budget. A chunk
+ * larger than this is processed in several tiles.
+ */
+constexpr u32 kTileAtoms = 512;
+
 #if !CTP_IS_DEVICE_PASS
 std::string g_last_error;
 
@@ -218,6 +240,9 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
   u32 *touched = reinterpret_cast<u32 *>(smem_raw + CLIO_YIELD_SMEM_BYTES);
   u64 *range = reinterpret_cast<u64 *>(touched + kPageBitmapWords);
   double *epart = reinterpret_cast<double *>(range + 2);
+  // The staged i-atom tile: positions then types.
+  float *tile_x = reinterpret_cast<float *>(epart + blockDim.x);
+  int *tile_t = reinterpret_cast<int *>(tile_x + 3 * kTileAtoms);
 
   u64 run = 0;
   double e_local = 0.0;
@@ -263,20 +288,35 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
                        : static_cast<u64>(inum);
     if (a0 >= a1) continue;
 
-    // ---- hold this chunk's OWN pages -----------------------------------
-    // x for the i-atoms, type for the i-atoms, and f to accumulate into.
-    // All three are held for the whole chunk: they are the one thing that
-    // does NOT churn, and re-holding them inside pass B would evict the
-    // neighbour page the block just faulted in.
-    co_await x.HoldPageCoro(a0 * kPosStride,
-                            (a1 - a0) * kPosStride, &run);
-    co_await type.HoldPageCoro(a0, a1 - a0, &run);
-    co_await f.HoldPageCoro(a0 * kPosStride, (a1 - a0) * kPosStride, &run);
+  // TILE the chunk. Everything below works on [t0, t1), a run of at most
+  // kTileAtoms i-atoms whose positions and types are STAGED IN SHARED MEMORY
+  // -- see kTileAtoms for why reading them from the page cache instead is a
+  // correctness bug rather than a slow path.
+  for (u64 t0 = a0; t0 < a1; t0 += kTileAtoms) {
+    const u64 t1 = (t0 + kTileAtoms < a1) ? (t0 + kTileAtoms) : a1;
 
-    // Zero this chunk's forces. A full neighbour list means every atom's
-    // force is computed here in its entirety, so assignment is correct and
-    // no read-modify-write of a stale page is needed.
-    for (u64 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
+    // Stage the tile: hold the i-atoms' pages, copy out, and never read them
+    // through the cache again.
+    co_await x.HoldPageCoro(t0 * kPosStride, (t1 - t0) * kPosStride, &run);
+    for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
+      const u64 o = (a - t0) * 3;
+      tile_x[o + 0] = x.at(a * kPosStride + 0);
+      tile_x[o + 1] = x.at(a * kPosStride + 1);
+      tile_x[o + 2] = x.at(a * kPosStride + 2);
+    }
+    __syncthreads();
+    co_await type.HoldPageCoro(t0, t1 - t0, &run);
+    for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
+      tile_t[a - t0] = type.at(a);
+    }
+    __syncthreads();
+
+    // f is a DIFFERENT vector with its own cache, so holding it here cannot
+    // disturb the position pages the neighbour loop is about to churn
+    // through. Zeroing is correct rather than accumulating because a full
+    // list computes each atom's force in its entirety.
+    co_await f.HoldPageCoro(t0 * kPosStride, (t1 - t0) * kPosStride, &run);
+    for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
       f[a * kPosStride + 0] = 0.0f;
       f[a * kPosStride + 1] = 0.0f;
       f[a * kPosStride + 2] = 0.0f;
@@ -295,8 +335,8 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
     // every probe missed, the touched-page bitmap stayed empty, and the kernel
     // computed nothing at all -- while still reporting success. The run
     // finished with E_pair exactly 0 and zero faults, zero writebacks.
-    const u64 k0 = static_cast<u64>(offset[a0]);
-    const u64 k1 = static_cast<u64>(offset[a1]);
+    const u64 k0 = static_cast<u64>(offset[t0]);
+    const u64 k1 = static_cast<u64>(offset[t1]);
     const u64 npe = neigh.h_->elems_per_page_;
 
     for (u64 np = (k1 > k0 ? k0 / npe : 0); k1 > k0 && np <= (k1 - 1) / npe;
@@ -374,13 +414,16 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
           co_await tn.HoldPageCoro(pg * xpe / kPosStride, xpe / kPosStride,
                                    &run);
 
-          for (u64 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
+          for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
             const int ii = static_cast<int>(a);
             const int i = ilist[ii];
-            const float xtmp = x.at(static_cast<u64>(i) * kPosStride + 0);
-            const float ytmp = x.at(static_cast<u64>(i) * kPosStride + 1);
-            const float ztmp = x.at(static_cast<u64>(i) * kPosStride + 2);
-            const int itype = type.at(static_cast<u64>(i));
+            // From SHARED, not from the page cache: the j-page hold above
+            // may well have evicted the page atom i lives on.
+            const u64 so = (a - t0) * 3;
+            const float xtmp = tile_x[so + 0];
+            const float ytmp = tile_x[so + 1];
+            const float ztmp = tile_x[so + 2];
+            const int itype = tile_t[a - t0];
 
             // This atom's entries, clipped to the neighbour page currently
             // held. Both ends matter: reading outside [e0, e1) would index a
@@ -438,9 +481,10 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
     // them durable before the host reads them back.
     __syncthreads();
     if (threadIdx.x == 0) {
-      f.BeginFlush(a0 * kPosStride, (a1 - a0) * kPosStride);
+      f.BeginFlush(t0 * kPosStride, (t1 - t0) * kPosStride);
     }
     __syncthreads();
+    }
   }
 
   // Per-block energy reduction, then one atomic into the global accumulator.
@@ -875,9 +919,12 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
 
   const u64 atoms_per_page =
       (ctx->cfg.page_bytes / sizeof(float)) / kPosStride;
+  // Must match the hand-packed layout at the top of PairLJCutCoro, in order:
+  // yield state, page bitmap, min/max range, per-thread energy, i-atom tile.
   const size_t smem = CLIO_YIELD_SMEM_BYTES +
                       kPageBitmapWords * sizeof(u32) + 2 * sizeof(u64) +
-                      ctx->cfg.nthreads * sizeof(double);
+                      ctx->cfg.nthreads * sizeof(double) +
+                      kTileAtoms * (3 * sizeof(float) + sizeof(int));
 
   auto xd = ctx->x->GetDevice(ctx->cfg.gpu_id);
   auto td = ctx->type->GetDevice(ctx->cfg.gpu_id);
