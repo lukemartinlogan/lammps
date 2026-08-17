@@ -22,6 +22,14 @@ compose:
     pool_query: local
     pool_id: "512.0"
     storage:
+      # NOTE: capacity_limit on an hbm tier is a GPU allocation taken at
+      # STARTUP, whatever the workload does, so it lands in peak VRAM before
+      # a single page is faulted. 1024MB is generous here because this
+      # example's atom arrays are meant to stay hot; do not copy the number
+      # into a config whose point is to MEASURE what paging saves. In LBANN
+      # this exact value made the paged path read as a 7x memory loss on a
+      # small model, and hid an 11.7x saving on a large one. See
+      # ../../../lbann/src/eternia/test/clio.yaml for a sizing rationale.
       - path: "hbm::lmp_hbm"
         bdev_type: "hbm"
         capacity_limit: "1024MB"
