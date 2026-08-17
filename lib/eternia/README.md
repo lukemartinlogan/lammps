@@ -253,3 +253,43 @@ against stock `lj/cut`: after the change E_pair is 719.04408 against stock's
   is far slower than stock `lj/cut` on a system that fits in memory - the
   comparison it is built for is against out-of-core alternatives, not against
   an in-core run.
+
+## Building with KOKKOS for a GPU baseline
+
+The ETERNIA package alone gives no way to compare against a GPU: a default
+LAMMPS build has no GPU package at all, so `pair_style lj/cut` is a single CPU
+core and every ratio against it flatters the paged kernel. Build KOKKOS
+alongside ETERNIA and both live in one binary:
+
+    export PATH=/usr/local/cuda/bin:$PATH        # nvcc_wrapper needs nvcc
+    cmake -S cmake -B build-kk \
+      -D CMAKE_BUILD_TYPE=Release \
+      -D CMAKE_CXX_COMPILER=$PWD/lib/kokkos/bin/nvcc_wrapper \
+      -D PKG_KOKKOS=ON -D Kokkos_ENABLE_CUDA=ON -D Kokkos_ARCH_ADA89=ON \
+      -D Kokkos_ENABLE_SERIAL=ON \
+      -D PKG_ETERNIA=ON -D iowarp-core_DIR=<clio-install>/lib/cmake/iowarp-core \
+      -D ETERNIA_CUDA_ARCHITECTURES=89 \
+      -D BUILD_MPI=OFF -D BUILD_OMP=OFF
+    cmake --build build-kk -j
+
+`Kokkos_ARCH_*` must match the card (ADA89 = compute 8.9). The two CUDA
+toolchains coexist because ETERNIA's device half is an ExternalProject with its
+own clang, so nvcc_wrapper compiling LAMMPS does not touch it.
+
+Running each kernel:
+
+    lmp -in in.melt.eternia                  # paged, lj/cut/eternia
+    lmp -k on g 1 -sf kk -in in.melt.kk      # GPU baseline, lj/cut/kk
+
+Verified at 665,500 atoms, all three agreeing to seven figures:
+
+| kernel | E_pair | peak VRAM |
+|---|---|---|
+| `lj/cut/eternia` (paged) | -4.7597029 | 3109 MiB |
+| `lj/cut/kk` (GPU) | -4.7597031 | 535 MiB |
+| `lj/cut` (serial CPU) | -4.7597031 | none |
+
+The GPU baseline changes the comparison substantially. At 62,500 atoms the
+paged pair kernel takes 1.153 s against 0.0097 s for `lj/cut/kk` -- about 119x,
+where the CPU baseline had suggested 7.6x. Ratios measured against the serial
+CPU kernel should not be quoted as GPU comparisons.
