@@ -7,6 +7,8 @@
 
 #include "pair_lj_cut_eternia.h"
 
+#include <cstdlib>
+
 #include "atom.h"
 #include "comm.h"
 #include "error.h"
@@ -97,6 +99,21 @@ void PairLJCutEternia::settings(int narg, char **arg)
 
 void PairLJCutEternia::init_style()
 {
+  // Under ETERNIA_BASELINE this style must behave as PairLJCut in EVERY
+  // respect, not just in compute(). The paged kernel asks for a FULL neighbour
+  // list because it writes only its own i-atoms; the stock kernel expects a
+  // HALF list. Delegating compute() while still requesting a full list makes
+  // the stock kernel visit every pair twice -- measured E_pair = -10.570786
+  // against the correct -4.7855792, a 2.2x error that looks like a physics
+  // difference rather than a list-type mismatch.
+  //
+  // The `newton off` requirement is also lifted here: it exists for the paged
+  // kernel's sake, and stock lj/cut is happy either way.
+  if (baseline_mode()) {
+    PairLJCut::init_style();
+    return;
+  }
+
   // init_style runs before every run command, and the coefficients may have
   // been changed by a pair_coeff since the last one. The context outlives a
   // run, so unless they are re-pushed the device keeps the previous run's
@@ -168,6 +185,28 @@ void PairLJCutEternia::push_state()
 
 void PairLJCutEternia::compute(int eflag, int vflag)
 {
+  // ETERNIA_BASELINE runs the STOCK lj/cut kernel from the parent class
+  // instead of the paged one. Same binary, same input script, one environment
+  // variable -- so a performance comparison does not need a second build or a
+  // second input, and nothing but the kernel differs between the two runs.
+  //
+  // Announced once, loudly. A run that says lj/cut/eternia in its input and
+  // silently computed something else would be the worst kind of benchmark
+  // result: correct, fast, and measuring the wrong thing.
+  //
+  // NOTE the baseline here is LAMMPS's CPU pair style. This build has no GPU
+  // package, so this comparison is paged-GPU against stock-CPU and is NOT a
+  // like-for-like GPU measurement; see the ETERNIA README.
+  if (baseline_mode()) {
+    if (comm->me == 0 && !baseline_announced) {
+      baseline_announced = 1;
+      utils::logmesg(lmp, "lj/cut/eternia: ETERNIA_BASELINE set, running the "
+                          "stock lj/cut CPU kernel instead of the paged one\n");
+    }
+    PairLJCut::compute(eflag, vflag);
+    return;
+  }
+
   ev_init(eflag, vflag);
 
   ensure_context();

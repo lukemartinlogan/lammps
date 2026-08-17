@@ -18,6 +18,8 @@ PairStyle(lj/cut/eternia,PairLJCutEternia);
 
 #include "pair_lj_cut.h"
 
+#include <cstdlib>
+
 // The boundary header: no CUDA, no Clio. See lib/eternia/eternia_lammps.h
 // for why the split exists.
 #include "eternia_lammps.h"
@@ -57,6 +59,19 @@ class PairLJCutEternia : public PairLJCut {
   /** nall the context was sized for; a change forces a rebuild, because the
    *  vectors' logical length is fixed at construction. */
   int ctx_nall;
+
+  /** One-shot latch so the ETERNIA_BASELINE notice prints once per run rather
+   *  than once per timestep. */
+  int baseline_announced = 0;
+
+  /** True when ETERNIA_BASELINE selects the stock lj/cut kernel. Read once and
+   *  cached: it must give the SAME answer in init_style and compute, or the
+   *  style requests one neighbour list and uses another. */
+  static bool baseline_mode()
+  {
+    static const bool on = (std::getenv("ETERNIA_BASELINE") != nullptr);
+    return on;
+  }
 
   /** Set whenever the coefficients may have changed, cleared once they have
    *  been pushed to the device. The context outlives a run command, so
