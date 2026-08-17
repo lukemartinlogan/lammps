@@ -46,17 +46,21 @@ struct Config {
   int gpu_id = 0;
 
   /** Page granularity, in bytes, shared by all four vectors. A page of x
-   *  holds page_bytes/(3*sizeof(float)) atoms, so this is really "how many
-   *  atoms travel together" -- see the note on spatial ordering in
-   *  UploadAtoms. */
+   *  holds page_bytes/(4*sizeof(float)) atoms -- FOUR floats per atom, not
+   *  three; see kPosStride in the implementation for why the padding is
+   *  load-bearing. So this is really "how many atoms travel together" -- see
+   *  the note on spatial ordering in UploadAtoms. */
   std::uint64_t page_bytes = 262144;
 
   /** CUDA launch geometry. Every Eternia hold is BLOCK-COLLECTIVE, so the
-   *  block is the unit that owns a page cache and the unit that suspends. */
+   *  block is the unit that owns a page cache and the unit that suspends.
+   *  nthreads MUST be a power of two (the energy and virial reductions are
+   *  tree reductions); Create rejects anything else. */
   std::uint32_t nblocks = 64;
   std::uint32_t nthreads = 256;
 
-  /** Resident pages per block, per vector. */
+  /** Resident pages per block, per vector. slots_x must be >= 3 so the
+   *  i-atom page and the j-atom page can be resident together. */
   std::uint32_t slots_x = 16;
   std::uint32_t slots_type = 4;
   std::uint32_t slots_neigh = 4;

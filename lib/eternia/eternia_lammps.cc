@@ -672,6 +672,29 @@ Context *Create(const Config &cfg, int nall) {
     SetError("Create: nall must be positive");
     return nullptr;
   }
+  // Both of these are documented requirements, and neither was checked. An
+  // unenforced constraint here does not fail loudly: the block reductions
+  // for energy and virial halve blockDim.x each step, so a thread count that
+  // is not a power of two silently DROPS the contributions of the threads
+  // above the largest power of two below it, and reports a smaller energy
+  // with no error anywhere. That is the same silent-wrong-answer shape as
+  // every other defect this backend has had.
+  if (cfg.nthreads == 0 || cfg.nthreads > 1024 ||
+      (cfg.nthreads & (cfg.nthreads - 1)) != 0) {
+    SetError("threads per block must be a power of two between 1 and 1024: "
+             "the energy and virial reductions are tree reductions and would "
+             "silently drop contributions otherwise");
+    return nullptr;
+  }
+  // The i-atom page, the j-atom page and one spare have to be resident
+  // together; with fewer slots a claim can evict the page the block is
+  // reading from.
+  if (cfg.slots_x < 3) {
+    SetError("slots must be at least 3: the i-atom page and the j-atom page "
+             "must be resident together, with one spare so a claim cannot "
+             "evict either");
+    return nullptr;
+  }
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
     SetError("Clio runtime init failed (is the daemon running?)");
     return nullptr;
