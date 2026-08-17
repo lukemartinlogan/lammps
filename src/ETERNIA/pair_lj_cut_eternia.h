@@ -58,6 +58,12 @@ class PairLJCutEternia : public PairLJCut {
    *  vectors' logical length is fixed at construction. */
   int ctx_nall;
 
+  /** Set whenever the coefficients may have changed, cleared once they have
+   *  been pushed to the device. The context outlives a run command, so
+   *  pushing them only at creation would silently keep using the previous
+   *  run's coefficients after a new pair_coeff. */
+  int params_dirty;
+
   /** Reupload positions and the neighbour list. Positions change every step,
    *  the list only on reneighbouring -- but the flattened list indexes atoms
    *  by their CURRENT ordering, so a sort invalidates both together. */

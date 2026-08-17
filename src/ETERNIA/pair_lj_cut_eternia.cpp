@@ -23,7 +23,7 @@ using namespace LAMMPS_NS;
 /* ---------------------------------------------------------------------- */
 
 PairLJCutEternia::PairLJCutEternia(LAMMPS *lmp) :
-    PairLJCut(lmp), ctx(nullptr), ctx_nall(0)
+    PairLJCut(lmp), ctx(nullptr), ctx_nall(0), params_dirty(1)
 {
   // A full list is not a preference, it is what makes the paged write path
   // possible at all: with a half list each pair must also be applied to atom
@@ -97,6 +97,12 @@ void PairLJCutEternia::settings(int narg, char **arg)
 
 void PairLJCutEternia::init_style()
 {
+  // init_style runs before every run command, and the coefficients may have
+  // been changed by a pair_coeff since the last one. The context outlives a
+  // run, so unless they are re-pushed the device keeps the previous run's
+  // values -- wrong forces, no error.
+  params_dirty = 1;
+
   if (!eternia_lammps::Available())
     error->all(FLERR, "pair_style lj/cut/eternia: {}", eternia_lammps::LastError());
 
@@ -134,11 +140,17 @@ void PairLJCutEternia::ensure_context()
     if (!ctx)
       error->all(FLERR, "pair_style lj/cut/eternia: {}", eternia_lammps::LastError());
 
+  }
+
+  // Push the coefficients whenever they may have changed, NOT only when the
+  // context is created -- see params_dirty.
+  if (params_dirty) {
     const int np1 = atom->ntypes + 1;
     // LAMMPS stores these as double** from memory->create; the rows are
     // contiguous, so lj1[0] is the flat [np1*np1] block the backend wants.
     eternia_lammps::SetLJParams(ctx, lj1[0], lj2[0], lj3[0], lj4[0], offset[0],
                                 cutsq[0], np1);
+    params_dirty = 0;
   }
 }
 
