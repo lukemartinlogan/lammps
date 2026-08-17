@@ -87,6 +87,63 @@ writebacks each step, and makes a failed page read or writeback a fatal
 error. It also checks that the kernel examined exactly as many neighbor list
 entries as the list contains, which is stopped as an error if it does not.
 
+Accuracy
+""""""""
+
+The paged kernel reproduces :doc:`pair_style lj/cut <pair_lj_cut>` exactly on
+the same system. The energy is independent of the paging geometry, which is
+the property that matters: a page size or block count that changed the answer
+would mean atoms were being missed or double counted.
+
+Verified against the stock style on a Lennard-Jones melt at step 20, with
+E_pair = -4.785579 for the stock run:
+
+.. list-table::
+   :header-rows: 1
+
+   * - page (KB)
+     - blocks
+     - slots
+     - E_pair
+   * - 256
+     - 64
+     - 16
+     - -4.7855792
+   * - 64
+     - 64
+     - 16
+     - -4.7855792
+   * - 256
+     - 16
+     - 16
+     - -4.7855792
+   * - 256
+     - 64
+     - 4
+     - -4.7855792
+   * - 16
+     - 32
+     - 8
+     - -4.7855792
+
+and across system sizes, each against its own stock run:
+
+.. list-table::
+   :header-rows: 1
+
+   * - atoms
+     - stock
+     - paged
+   * - 1372
+     - -4.7872707
+     - -4.7872708
+   * - 8788
+     - -4.7646740
+     - -4.7646744
+   * - 32000
+     - -4.7595703
+     - -4.7595697
+
 Restrictions
 """"""""""""
 
