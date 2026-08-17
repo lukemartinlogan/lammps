@@ -51,6 +51,7 @@ gives those details.
    * :ref:`DRUDE <PKG-DRUDE>`
    * :ref:`EFF <PKG-EFF>`
    * :ref:`ELECTRODE <PKG-ELECTRODE>`
+   * :ref:`ETERNIA <PKG-ETERNIA>`
    * :ref:`EXTRA-COMMAND <PKG-EXTRA-COMMAND>`
    * :ref:`EXTRA-COMPUTE <PKG-EXTRA-COMPUTE>`
    * :ref:`EXTRA-DUMP <PKG-EXTRA-DUMP>`
@@ -956,6 +957,34 @@ Additional command styles that are less commonly used.
 * :doc:`general commands <Commands_all>`
 
 ----------
+
+.. _PKG-ETERNIA:
+
+ETERNIA package
+---------------
+
+**Contents:**
+
+An out-of-core pair style, :doc:`lj/cut/eternia <pair_lj_cut_eternia>`, that
+holds per-atom positions, types, forces and the neighbor list in the IOWarp
+Context Transfer Engine and reads them into GPU memory on demand from inside
+the force kernel. This allows a simulation whose data is larger than the
+memory of the GPU, at a substantial cost in speed.
+
+**Authors:** The IOWarp project.
+
+**Install:**
+
+This package requires a CUDA device, a coroutine-capable clang, and an
+installation of IOWarp Core. See the :ref:`ETERNIA build instructions
+<eternia>` and ``lib/eternia/README.md``.
+
+**Supporting info:**
+
+* ``src/ETERNIA``: filenames -> commands
+* ``lib/eternia/README.md``
+* :doc:`pair_style lj/cut/eternia <pair_lj_cut_eternia>`
+* ``examples/ETERNIA``
 
 .. _PKG-EXTRA-COMPUTE:
 

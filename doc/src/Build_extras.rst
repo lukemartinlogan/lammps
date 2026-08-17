@@ -2105,3 +2105,30 @@ To build with this package, you must download and build the
 
       The SCAFACOS package no longer supports the traditional make build.
       You need to build LAMMPS with CMake.
+
+.. _eternia:
+
+ETERNIA package
+---------------------------------------
+
+The ETERNIA package holds per-atom data in the IOWarp Context Transfer
+Engine and pages it into GPU memory from inside the force kernel, so a
+simulation can be larger than the memory of the GPU.
+
+It requires an installation of IOWarp Core built with GPU coroutines, and
+builds its device half with clang, because the paging kernel suspends on a
+page fault using C++20 device coroutines that nvcc cannot compile:
+
+.. code-block:: bash
+
+   cmake -S cmake -B build -D PKG_ETERNIA=yes \
+     -D iowarp-core_DIR=${CLIO}/lib/cmake/iowarp-core \
+     -D ETERNIA_CUDA_ARCHITECTURES=89
+
+``ETERNIA_CUDA_COMPILER`` selects the clang used for the device half and
+defaults to ``clang++-22``. The full recipe, including how to build and
+install IOWarp Core itself, is in ``lib/eternia/README.md``.
+
+Note that the Clio runtime is started in-process and needs a server
+configuration named by the ``CLIO_SERVER_CONF`` environment variable; see
+``examples/ETERNIA/clio.yaml``.
