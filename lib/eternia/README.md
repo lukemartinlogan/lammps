@@ -212,6 +212,32 @@ system that exceeds this machine's VRAM, so on a larger GPU the offset table
 has to widen to 64 bits before the memory limit is reached. Exceeding it is
 now a clean error rather than a silent wrap.
 
+## Rejected configurations, and a check worth knowing about
+
+Two settings are validated at context creation, because neither would fail
+loudly on its own:
+
+* `threads` not a power of two is rejected. The energy and virial reductions
+  are tree reductions, so a thread count like 100 would silently drop every
+  thread above 64 and report a smaller energy.
+* `slots` below 3 is rejected. The i-atom page and the j-atom page must be
+  resident together, with one spare, or a claim evicts the page the block is
+  reading from.
+
+Coefficients are re-pushed to the device whenever they may have changed, not
+only when the context is created. The context outlives a `run`, so
+
+```
+pair_coeff * * 1.0 1.0
+run 5
+pair_coeff * * 2.0 1.5
+run 5
+```
+
+used to run the second five steps with the first coefficients. Verified
+against stock `lj/cut`: after the change E_pair is 719.04408 against stock's
+719.04409, where the stale behaviour left it near -6.55.
+
 ## Not yet done
 
 - **Multi-rank.** Each rank would need its own tag prefix and GPU; the pair
