@@ -278,7 +278,7 @@ void PairLJCutEternia::report_stats()
   const eternia_lammps::Stats s = eternia_lammps::GetStats(ctx);
   if (comm->me == 0) {
     utils::logmesg(lmp,
-                   "eternia step {}: mask {} ago {} rounds {} kernel_ms {:.2f} [launch {:.1f} copy {:.1f} upl {:.1f}] scanned {} blaunch {} | x faults {} evicts {} | neigh faults {} | "
+                   "eternia step {}: mask {} ago {} rounds {} kernel_ms {:.2f} [launch {:.1f} copy {:.1f} upl {:.1f}] scanned {} holds {} | x faults {} evicts {} | neigh faults {} | "
                    "f puts {} (errors {}) | get errors {} | pairs {}/{} passb_cyc {} hold_cyc {}\n",
                    update->ntimestep, s.drop_mask, neighbor->ago, s.rounds, s.kernel_ms,
                    s.t_launch_ms, s.t_copy_ms, s.t_upload_ms, s.entries_scanned, s.block_launches,

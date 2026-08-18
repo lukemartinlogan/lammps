@@ -250,7 +250,7 @@ __device__ CTP_INLINE void PairLJCutPageChunk(
     const gv::DeviceVector<float> &x,
     const int *offset, const int *ilist, const float *tile_x,
     const int *tile_t, const LJParams &lj, u64 pg, u64 e0, u64 e1,
-    u64 t0, u64 t1, int eflag,
+    u64 t0, u64 t1, int eflag, int loop_level,
     double *e_local, double *v_local, unsigned long long *n_pairs,
     unsigned long long *n_scan, unsigned long long *n_badtype,
     unsigned long long *n_cut) {
@@ -289,13 +289,21 @@ __device__ CTP_INLINE void PairLJCutPageChunk(
     for (u64 k = s; k < e; ++k) {
       const u64 j = static_cast<u64>(npage[k - nbase]);
       ++(*n_scan);
+      // BISECTION (ETERNIA_LOOP_LEVEL): 1 = the neighbour load only, 2 = plus
+      // the page filter, 3 = plus the j-atom loads, 4 = the whole body. Every
+      // structural hypothesis so far has been disproved by measurement, so
+      // this measures the body a piece at a time instead of guessing which
+      // piece is expensive.
+      if (loop_level <= 1) { *n_pairs += j & 1u; continue; }
       if (AtomPage(x, j) != pg) continue;
       ++(*n_pairs);
+      if (loop_level <= 2) continue;
       const u64 jx = j * kPosStride - xbase;
       const float delx = xtmp - xpage[jx + 0];
       const float dely = ytmp - xpage[jx + 1];
       const float delz = ztmp - xpage[jx + 2];
       const int jtype = tpage[j - tbase];
+      if (loop_level <= 3) { fx += delx + dely + delz + jtype; continue; }
       const float rsq = delx * delx + dely * dely + delz * delz;
       const int c = itype * lj.ntypes_p1 + jtype;
       if (itype == 0 || jtype == 0) ++(*n_badtype);
@@ -340,7 +348,7 @@ __device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
  * is over the NEIGHBOUR pages, which is the traffic the cache exists to
  * manage.
  */
-__device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
+__device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask, int loop_level,
                                        gv::DeviceVector<float> x,
                                        gv::DeviceVector<int> type,
                                        gv::DeviceVector<int> neigh,
@@ -399,6 +407,8 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
   unsigned long long n_scan = 0;
   unsigned long long c_passb = 0;   // cycles inside PASS B's compute loop
   unsigned long long c_hold = 0;    // cycles inside the page holds
+  unsigned long long c_holds = 0;   // how many holds that was
+  unsigned long long c_susp = 0;    // holds that crossed a suspension
   unsigned long long n_badtype = 0;   // itype or jtype read back as 0
   unsigned long long n_cut = 0;       // rejected by the cutoff test
 
@@ -458,7 +468,10 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
 
     // Stage the tile: hold the i-atoms' pages, copy out, and never read them
     // through the cache again.
-    co_await x.HoldPageCoro(t0 * kPosStride, (t1 - t0) * kPosStride, &run);
+    run = x.TryHoldFast(t0 * kPosStride, (t1 - t0) * kPosStride);
+    if (run == 0) {
+      co_await x.HoldPageCoro(t0 * kPosStride, (t1 - t0) * kPosStride, &run);
+    }
     for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
       const u64 o = (a - t0) * 3;
       tile_x[o + 0] = x.at(a * kPosStride + 0);
@@ -466,7 +479,10 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
       tile_x[o + 2] = x.at(a * kPosStride + 2);
     }
     __syncthreads();
-    co_await type.HoldPageCoro(t0, t1 - t0, &run);
+    run = type.TryHoldFast(t0, t1 - t0);
+    if (run == 0) {
+      co_await type.HoldPageCoro(t0, t1 - t0, &run);
+    }
     for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
       tile_t[a - t0] = type.at(a);
     }
@@ -476,6 +492,12 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
     // disturb the position pages the neighbour loop is about to churn
     // through. Zeroing is correct rather than accumulating because a full
     // list computes each atom's force in its entirety.
+    // f is WRITTEN, and its writeback is driven by the eviction that a hold
+    // performs. Fast-pathing it removes those evictions, and the explicit
+    // FlushBlockBatched below did not make up the difference: force writebacks
+    // fell from 123 to 8 and the energy drifted to -4.6799284 from the correct
+    // -4.7638693. Until that is understood, the written vector keeps the
+    // original path; the read-only ones do not need it.
     co_await f.HoldPageCoro(t0 * kPosStride, (t1 - t0) * kPosStride, &run);
     for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
       f[a * kPosStride + 0] = 0.0f;
@@ -508,7 +530,10 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
 
       // Collective: every thread ends up with this page in its last_page_,
       // so the scans below can read it with at().
-      co_await neigh.HoldPageCoro(e0, e1 - e0, &run);
+      run = neigh.TryHoldFast(e0, e1 - e0);
+      if (run == 0) {
+        co_await neigh.HoldPageCoro(e0, e1 - e0, &run);
+      }
 
       // ---- PASS A: which position pages do THESE entries touch? --------
       if (threadIdx.x == 0) {
@@ -572,14 +597,28 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
           gv::DeviceVector<int> tn = type;
           const u64 xpe = x.h_->elems_per_page_;
           const long long _h0 = clock64();
-          co_await xn.HoldPageCoro(pg * xpe, xpe, &run);
-          co_await tn.HoldPageCoro(pg * xpe / kPosStride, xpe / kPosStride,
-                                   &run);
-          if (threadIdx.x == 0) c_hold += (u64)(clock64() - _h0);
+          run = xn.TryHoldFast(pg * xpe, xpe);
+          if (run == 0) {
+            co_await xn.HoldPageCoro(pg * xpe, xpe, &run);
+          }
+          run = tn.TryHoldFast(pg * xpe / kPosStride, xpe / kPosStride);
+          if (run == 0) {
+            co_await tn.HoldPageCoro(pg * xpe / kPosStride, xpe / kPosStride,
+                                     &run);
+          }
+          if (threadIdx.x == 0) {
+            // A hold that SUSPENDS resumes in a different kernel launch, where
+            // clock64 has a different base, so its delta is meaningless. Split
+            // the two: deltas under a threshold are holds that stayed resident
+            // and are the number that matters -- how much a HIT costs.
+            const u64 d = (u64)(clock64() - _h0);
+            if (d < 200000ull) { c_hold += d; ++c_holds; }
+            else { ++c_susp; }
+          }
 
           const long long _pb0 = clock64();
           PairLJCutPageChunk(xn, tn, neigh, f, x, offset, ilist, tile_x, tile_t,
-                             lj, pg, e0, e1, t0, t1, eflag, &e_local, v_local,
+                             lj, pg, e0, e1, t0, t1, eflag, loop_level, &e_local, v_local,
                              &n_pairs, &n_scan, &n_badtype, &n_cut);
           if (threadIdx.x == 0) c_passb += (u64)(clock64() - _pb0);
           __syncthreads();
@@ -628,17 +667,31 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
   if (threadIdx.x == 0) {
     atomicAdd(&pairs_out[1], c_passb);
     atomicAdd(&pairs_out[2], c_hold);
+    atomicAdd(&pairs_out[4], c_holds);
+    atomicAdd(&pairs_out[1], c_susp);
   }
   atomicAdd(&pairs_out[1], n_badtype);
   atomicAdd(&pairs_out[2], n_cut);
 
   // Every force page must be durable before the host reads it: the puts were
   // only issued above.
+  // FlushBlockBatched is REQUIRED, not an optimisation. Force pages used to
+  // be written back as a side effect of being evicted by the next hold; with
+  // the resident fast path in HoldPageCoro a page that stays resident is
+  // never evicted, so nothing would submit its put and the host would read
+  // the previous step's forces. That failure is silent -- the energy stays
+  // plausible -- so every dirty page is flushed explicitly here, and the
+  // wait below then has something to wait for.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    f.FlushBlockBatched();
+  }
+  __syncthreads();
   co_await FlushWaitCoro(f);
 }
 
 __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
-                                clio::run::u32 drop_mask,
+                                clio::run::u32 drop_mask, int loop_level,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<int> type,
                                 gv::DeviceVector<int> neigh,
@@ -664,7 +717,7 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
   // slow; if in-kernel time is a small fraction, the cost is launch and
   // teardown and no amount of tuning the pair loop will help.
   const long long _k0 = clock64();
-  CLIO_YCORO_RUN(PairLJCutCoro(drop_mask, x, type, neigh, f, offset, ilist, inum, lj,
+  CLIO_YCORO_RUN(PairLJCutCoro(drop_mask, loop_level, x, type, neigh, f, offset, ilist, inum, lj,
                                atoms_per_page, nblocks, yv.Block(), eflag,
                                energy_out, virial_out, pairs_out, scratch));
   if (threadIdx.x == 0) {
@@ -1130,11 +1183,37 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
   if (const char *e = std::getenv("ETERNIA_DROP_MASK")) {
     drop_mask = static_cast<u32>(std::atoi(e));
   }
+  // OCCUPANCY, straight from the driver -- no profiler permission needed.
+  // How many of these blocks actually fit on an SM decides whether memory
+  // latency can be hidden at all, and it is set by registers and shared
+  // memory, not by how many blocks the launch asks for. Reported once because
+  // grid size has been swept from 64 to 1024 with no effect, which is what a
+  // hard per-SM residency limit looks like.
+  {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      int blocks_per_sm = 0;
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &blocks_per_sm, PairLJCutKernel, static_cast<int>(ctx->cfg.nthreads),
+          smem);
+      int nsm = 0;
+      cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+      std::fprintf(stderr,
+                   "[eternia] occupancy: %d block(s)/SM at %u threads and "
+                   "%zu B smem; %d SMs -> %d resident warps of %d requested\n",
+                   blocks_per_sm, ctx->cfg.nthreads, (size_t)smem, nsm,
+                   blocks_per_sm * nsm * (int)(ctx->cfg.nthreads / 32),
+                   (int)(ctx->cfg.nblocks * ctx->cfg.nthreads / 32));
+    }
+  }
+  int loop_level = 4;
+  if (const char *e = std::getenv("ETERNIA_LOOP_LEVEL")) loop_level = std::atoi(e);
   YieldRunner runner(ctx->cfg.nblocks, ctx->cfg.nthreads);
   const auto k_t0 = std::chrono::steady_clock::now();
   const u32 rounds = runner.Run(
       [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-        PairLJCutKernel<<<g, b, smem>>>(gpu, drop_mask, xd, td, nd, fd, ctx->d_offset,
+        PairLJCutKernel<<<g, b, smem>>>(gpu, drop_mask, loop_level, xd, td, nd, fd, ctx->d_offset,
                                         ctx->d_ilist, ctx->inum, ctx->lj,
                                         atoms_per_page, ctx->cfg.nblocks,
                                         eflag, ctx->d_energy, ctx->d_virial,
