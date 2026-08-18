@@ -79,6 +79,10 @@ class PairLJCutEternia : public PairLJCut {
    *  run's coefficients after a new pair_coeff. */
   int params_dirty;
 
+  /** Whether the flattened neighbour list has been pushed at least once. The
+   *  list is otherwise uploaded only on a rebuild step. */
+  int neigh_pushed_once = 0;
+
   /** Reupload positions and the neighbour list. Positions change every step,
    *  the list only on reneighbouring -- but the flattened list indexes atoms
    *  by their CURRENT ordering, so a sort invalidates both together. */

@@ -177,8 +177,27 @@ void PairLJCutEternia::push_state()
 {
   const int nall = atom->nlocal + atom->nghost;
   eternia_lammps::UploadAtoms(ctx, atom->x, atom->type, nall);
-  eternia_lammps::UploadNeighbors(ctx, list->ilist, list->numneigh,
-                                  list->firstneigh, list->inum);
+
+  // The neighbour list only changes when it is REBUILT. Re-uploading it on
+  // every step re-sent 45 MB per step at 62,500 atoms for bytes the device
+  // already had, and -- worse -- forced the kernel to drop its list cache
+  // every launch, because the host had rewritten the backing store underneath
+  // it. The counters showed the result plainly: 77 list faults per step, the
+  // same on every step, with a page cache large enough to hold the whole
+  // dataset several times over.
+  //
+  // `neighbor->ago` is 0 on the step the list was rebuilt. Atom sorting also
+  // invalidates the flattening -- the list indexes atoms by their current
+  // ordering -- but LAMMPS sorts during reneighbouring, so the same test
+  // covers it. A changed atom count means a new context anyway.
+  //
+  // Erring towards uploading is the safe direction: a needless upload costs
+  // time, a missed one computes forces from a stale list.
+  if (neighbor->ago == 0 || !neigh_pushed_once) {
+    eternia_lammps::UploadNeighbors(ctx, list->ilist, list->numneigh,
+                                    list->firstneigh, list->inum);
+    neigh_pushed_once = 1;
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -245,9 +264,10 @@ void PairLJCutEternia::report_stats()
   const eternia_lammps::Stats s = eternia_lammps::GetStats(ctx);
   if (comm->me == 0) {
     utils::logmesg(lmp,
-                   "eternia step {}: x faults {} evicts {} | neigh faults {} | "
+                   "eternia step {}: mask {} ago {} rounds {} kernel_ms {:.2f} | x faults {} evicts {} | neigh faults {} | "
                    "f puts {} (errors {}) | get errors {} | pairs {}/{} badtype {} cut {}\n",
-                   update->ntimestep, s.x_faults, s.x_evicts, s.neigh_faults,
+                   update->ntimestep, s.drop_mask, neighbor->ago, s.rounds, s.kernel_ms,
+                   s.x_faults, s.x_evicts, s.neigh_faults,
                    s.f_puts, s.f_put_errors, s.get_errors, s.pairs_seen,
                    s.pairs_expected, s.pairs_badtype, s.pairs_cut);
   }

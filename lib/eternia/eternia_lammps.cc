@@ -54,6 +54,8 @@
 #include "eternia_lammps.h"
 
 #include <cstdio>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -170,6 +172,15 @@ struct LJParams {
  */
 #if !CTP_IS_DEVICE_PASS
 struct Context {
+  /** Set by the upload functions, consumed and cleared by Compute. Kept here
+   *  rather than computed at launch so an upload cannot happen without the
+   *  matching cache drop -- the two would otherwise be free to disagree, and
+   *  the failure that produces is a plausible energy from stale coordinates.
+   *  Start true so the first launch drops everything. */
+  bool x_dirty = true;
+  bool type_dirty = true;
+  bool neigh_dirty = true;
+
   Config cfg;
   int nall = 0;
   int inum = 0;
@@ -233,7 +244,8 @@ __device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
  * is over the NEIGHBOUR pages, which is the traffic the cache exists to
  * manage.
  */
-__device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
+__device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
+                                       gv::DeviceVector<float> x,
                                        gv::DeviceVector<int> type,
                                        gv::DeviceVector<int> neigh,
                                        gv::DeviceVector<float> f,
@@ -305,12 +317,26 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
   // of coordinates that change each step. It is also why the eventual fix is
   // to move the integrator onto the vector so positions are updated IN the
   // cache rather than around it.
+  //
+  // DROP ONLY WHAT THE HOST REWROTE. Dropping all four every launch made the
+  // page cache useless: with a cache large enough to hold the entire dataset
+  // the counters still read 18 position faults, 77 list faults and 123 force
+  // writebacks on EVERY step, identical run to run. The list changes only when
+  // it is rebuilt (every 20 steps in the shipped example) and types never
+  // change at all, so most of that traffic was re-fetching bytes the device
+  // already had.
+  //
+  // The mask is set by the UPLOAD functions themselves rather than computed
+  // here, so a vector cannot be re-uploaded without being dropped -- the
+  // failure mode that would produce is a correct-looking energy computed from
+  // stale coordinates, which is exactly what the unconditional drop was
+  // guarding against.
   __syncthreads();
   if (threadIdx.x == 0) {
-    x.DropAll();
-    type.DropAll();
-    neigh.DropAll();
-    f.DropAll();
+    if (drop_mask & 1u) x.DropAll();
+    if (drop_mask & 2u) type.DropAll();
+    if (drop_mask & 4u) neigh.DropAll();
+    if (drop_mask & 8u) f.DropAll();
   }
   __syncthreads();
 
@@ -565,6 +591,7 @@ __device__ gy::YCoroMain PairLJCutCoro(gv::DeviceVector<float> x,
 }
 
 __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
+                                clio::run::u32 drop_mask,
                                 gv::DeviceVector<float> x,
                                 gv::DeviceVector<int> type,
                                 gv::DeviceVector<int> neigh,
@@ -585,7 +612,7 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
   f.block_override_ = yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(PairLJCutCoro(x, type, neigh, f, offset, ilist, inum, lj,
+  CLIO_YCORO_RUN(PairLJCutCoro(drop_mask, x, type, neigh, f, offset, ilist, inum, lj,
                                atoms_per_page, nblocks, yv.Block(), eflag,
                                energy_out, virial_out, pairs_out, scratch));
 }
@@ -838,6 +865,9 @@ void UploadAtoms(Context *ctx, const double *const *x, const int *type,
 #else
   (void)ctx; (void)x; (void)type; (void)nall;
 #endif
+  // Mark the cache stale for exactly the vectors this rewrote.
+  ctx->x_dirty = true;
+  ctx->type_dirty = true;
 }
 
 void UploadNeighbors(Context *ctx, const int *ilist, const int *numneigh,
@@ -950,6 +980,8 @@ void UploadNeighbors(Context *ctx, const int *ilist, const int *numneigh,
 #else
   (void)ctx; (void)ilist; (void)numneigh; (void)firstneigh; (void)inum;
 #endif
+  // Mark the cache stale for exactly the vectors this rewrote.
+  ctx->neigh_dirty = true;
 }
 
 void SetLJParams(Context *ctx, const double *lj1, const double *lj2,
@@ -1024,10 +1056,23 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
   auto nd = ctx->neigh->GetDevice(ctx->cfg.gpu_id);
   auto fd = ctx->f->GetDevice(ctx->cfg.gpu_id);
 
+  // f is ALWAYS dropped: it is the output, rewritten every step, and a stale
+  // resident force page would be added to rather than replaced.
+  u32 drop_mask = (ctx->x_dirty ? 1u : 0u) | (ctx->type_dirty ? 2u : 0u) |
+                  (ctx->neigh_dirty ? 4u : 0u) | 8u;
+  // DIAGNOSTIC ONLY. ETERNIA_DROP_MASK forces the mask so the question "does
+  // the page cache survive a kernel launch at all" can be asked directly.
+  // Forcing 0 produces wrong forces by design -- the host has rewritten the
+  // coordinates and the kernel would use the previous step's -- so it is for
+  // measuring fault counts, never for a result.
+  if (const char *e = std::getenv("ETERNIA_DROP_MASK")) {
+    drop_mask = static_cast<u32>(std::atoi(e));
+  }
   YieldRunner runner(ctx->cfg.nblocks, ctx->cfg.nthreads);
+  const auto k_t0 = std::chrono::steady_clock::now();
   const u32 rounds = runner.Run(
       [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-        PairLJCutKernel<<<g, b, smem>>>(gpu, xd, td, nd, fd, ctx->d_offset,
+        PairLJCutKernel<<<g, b, smem>>>(gpu, drop_mask, xd, td, nd, fd, ctx->d_offset,
                                         ctx->d_ilist, ctx->inum, ctx->lj,
                                         atoms_per_page, ctx->cfg.nblocks,
                                         eflag, ctx->d_energy, ctx->d_virial,
@@ -1046,6 +1091,16 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
     SetError(cudaGetErrorString(cudaGetLastError()));
     return false;
   }
+  // Cleared only after a SUCCESSFUL launch, so a failed step re-drops next
+  // time rather than trusting a cache the kernel may not have refreshed.
+  ctx->x_dirty = false;
+  ctx->type_dirty = false;
+  ctx->neigh_dirty = false;
+  ctx->stats.drop_mask = drop_mask;
+  ctx->stats.rounds = rounds;
+  ctx->stats.kernel_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - k_t0).count();
   if (rounds == 0) {
     // RunToCompletion returning zero rounds means the driver never saw the
     // kernel finish -- a page that never landed, which would otherwise show

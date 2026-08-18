@@ -73,6 +73,15 @@ struct Config {
 
 /** Paging activity of one compute(), summed over the four vectors. */
 struct Stats {
+  /** Kernel LAUNCHES the yield driver needed, and the wall time it spent in
+   *  them. The driver exits the kernel whenever a block faults and relaunches
+   *  once the page lands, so rounds is the number of times the whole grid was
+   *  torn down and restarted -- the quantity that decides whether this kernel
+   *  is fast, and it was not being reported at all. */
+  std::uint64_t rounds = 0;
+  std::uint32_t drop_mask = 0;
+  double kernel_ms = 0.0;
+
   std::uint64_t x_faults = 0;
   std::uint64_t x_evicts = 0;
   std::uint64_t neigh_faults = 0;
