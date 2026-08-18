@@ -58,6 +58,13 @@ if(ETERNIA_ENABLE)
   # fills, and clang is the first compiler here to exploit the UB.
   set(CMAKE_CUDA_FLAGS
       "${CMAKE_CUDA_FLAGS} -Wno-unknown-cuda-version -fno-strict-aliasing")
+  # Report registers and per-thread local memory. Occupancy on this kernel is
+  # the difference between hiding memory latency and paying all of it, and the
+  # coroutine frame makes register pressure a real risk -- so it should be
+  # visible in the build log rather than guessed at.
+  if(ETERNIA_PTXAS_VERBOSE)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcuda-ptxas -v")
+  endif()
   if(EXISTS "${CUDAToolkit_TARGET_DIR}/include/cccl")
     set(CMAKE_CUDA_FLAGS
         "${CMAKE_CUDA_FLAGS} -isystem ${CUDAToolkit_TARGET_DIR}/include/cccl")

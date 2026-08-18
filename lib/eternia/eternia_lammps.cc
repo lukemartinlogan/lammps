@@ -229,6 +229,102 @@ __device__ inline u64 AtomPage(const gv::DeviceVector<float> &x, u64 a) {
   return x.PageOf(a * kPosStride);
 }
 
+
+/**
+ * PASS B's inner work, deliberately OUTSIDE the coroutine.
+ *
+ * The kernel body is a C++20 device coroutine, so every local it holds has to
+ * survive a suspension and therefore lives in the per-thread yield frame --
+ * 4 KB of GLOBAL memory per lane. Loop counters, the force accumulators and
+ * the distance temporaries were all being read and written through memory on
+ * every neighbour entry, which measured at ~1215 cycles per entry against the
+ * ~10-30 the arithmetic needs.
+ *
+ * This function cannot suspend, so nvcc/clang is free to keep all of it in
+ * registers. Everything it needs is passed by value; the page holds stay in
+ * the coroutine where they belong.
+ */
+__device__ CTP_INLINE void PairLJCutPageChunk(
+    gv::DeviceVector<float> xn, gv::DeviceVector<int> tn,
+    gv::DeviceVector<int> neigh, gv::DeviceVector<float> f,
+    const gv::DeviceVector<float> &x,
+    const int *offset, const int *ilist, const float *tile_x,
+    const int *tile_t, const LJParams &lj, u64 pg, u64 e0, u64 e1,
+    u64 t0, u64 t1, int eflag,
+    double *e_local, double *v_local, unsigned long long *n_pairs,
+    unsigned long long *n_scan, unsigned long long *n_badtype,
+    unsigned long long *n_cut) {
+  // RAW PAGE POINTERS, resolved ONCE. at() re-reads last_page_ on every
+  // access, and last_page_ lives in the by-value view's per-thread LOCAL
+  // memory -- five local-memory loads per neighbour entry, on the hottest
+  // loop in the kernel. GetPagePtr() hands back the base of the page the
+  // hold already resolved, so the compiler can keep it in a register.
+  //
+  // Safe because the holds above cover exactly these ranges: the neighbour
+  // page [e0, e1), and position/type page pg. Indices are made page-relative
+  // here rather than per access.
+  const int *npage = neigh.GetPagePtr();
+  const float *xpage = xn.GetPagePtr();
+  const int *tpage = tn.GetPagePtr();
+  if (npage == nullptr || xpage == nullptr || tpage == nullptr) return;
+  const u64 nbase = e0 - (e0 % neigh.h_->elems_per_page_);
+  const u64 xbase = pg * xn.h_->elems_per_page_;
+  const u64 tbase = pg * (xn.h_->elems_per_page_ / kPosStride);
+
+  for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
+    const int ii = static_cast<int>(a);
+    const int i = ilist[ii];
+    const u64 so = (a - t0) * 3;
+    const float xtmp = tile_x[so + 0];
+    const float ytmp = tile_x[so + 1];
+    const float ztmp = tile_x[so + 2];
+    const int itype = tile_t[a - t0];
+
+    u64 s = static_cast<u64>(offset[ii]);
+    u64 e = static_cast<u64>(offset[ii + 1]);
+    if (s < e0) s = e0;
+    if (e > e1) e = e1;
+
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    for (u64 k = s; k < e; ++k) {
+      const u64 j = static_cast<u64>(npage[k - nbase]);
+      ++(*n_scan);
+      if (AtomPage(x, j) != pg) continue;
+      ++(*n_pairs);
+      const u64 jx = j * kPosStride - xbase;
+      const float delx = xtmp - xpage[jx + 0];
+      const float dely = ytmp - xpage[jx + 1];
+      const float delz = ztmp - xpage[jx + 2];
+      const int jtype = tpage[j - tbase];
+      const float rsq = delx * delx + dely * dely + delz * delz;
+      const int c = itype * lj.ntypes_p1 + jtype;
+      if (itype == 0 || jtype == 0) ++(*n_badtype);
+      if (rsq >= lj.cutsq[c]) { ++(*n_cut); continue; }
+
+      const float r2inv = 1.0f / rsq;
+      const float r6inv = r2inv * r2inv * r2inv;
+      const float forcelj = r6inv * (lj.lj1[c] * r6inv - lj.lj2[c]);
+      const float fpair = forcelj * r2inv;
+      fx += delx * fpair;
+      fy += dely * fpair;
+      fz += delz * fpair;
+      if (eflag) {
+        *e_local += 0.5 * static_cast<double>(
+            r6inv * (lj.lj3[c] * r6inv - lj.lj4[c]) - lj.offset[c]);
+      }
+      v_local[0] += 0.5 * static_cast<double>(delx * delx * fpair);
+      v_local[1] += 0.5 * static_cast<double>(dely * dely * fpair);
+      v_local[2] += 0.5 * static_cast<double>(delz * delz * fpair);
+      v_local[3] += 0.5 * static_cast<double>(delx * dely * fpair);
+      v_local[4] += 0.5 * static_cast<double>(delx * delz * fpair);
+      v_local[5] += 0.5 * static_cast<double>(dely * delz * fpair);
+    }
+    f[static_cast<u64>(i) * kPosStride + 0] += fx;
+    f[static_cast<u64>(i) * kPosStride + 1] += fy;
+    f[static_cast<u64>(i) * kPosStride + 2] += fz;
+  }
+}
+
 /** Wait out this block's outstanding writebacks by PARKING, not spinning. */
 __device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
   CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
@@ -301,6 +397,8 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
   double v_local[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   unsigned long long n_pairs = 0;
   unsigned long long n_scan = 0;
+  unsigned long long c_passb = 0;   // cycles inside PASS B's compute loop
+  unsigned long long c_hold = 0;    // cycles inside the page holds
   unsigned long long n_badtype = 0;   // itype or jtype read back as 0
   unsigned long long n_cut = 0;       // rejected by the cutoff test
 
@@ -473,80 +571,17 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
           gv::DeviceVector<float> xn = x;
           gv::DeviceVector<int> tn = type;
           const u64 xpe = x.h_->elems_per_page_;
+          const long long _h0 = clock64();
           co_await xn.HoldPageCoro(pg * xpe, xpe, &run);
           co_await tn.HoldPageCoro(pg * xpe / kPosStride, xpe / kPosStride,
                                    &run);
+          if (threadIdx.x == 0) c_hold += (u64)(clock64() - _h0);
 
-          for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
-            const int ii = static_cast<int>(a);
-            const int i = ilist[ii];
-            // From SHARED, not from the page cache: the j-page hold above
-            // may well have evicted the page atom i lives on.
-            const u64 so = (a - t0) * 3;
-            const float xtmp = tile_x[so + 0];
-            const float ytmp = tile_x[so + 1];
-            const float ztmp = tile_x[so + 2];
-            const int itype = tile_t[a - t0];
-
-            // This atom's entries, clipped to the neighbour page currently
-            // held. Both ends matter: reading outside [e0, e1) would index a
-            // page this block does not have.
-            u64 s = static_cast<u64>(offset[ii]);
-            u64 e = static_cast<u64>(offset[ii + 1]);
-            if (s < e0) s = e0;
-            if (e > e1) e = e1;
-
-            float fx = 0.0f, fy = 0.0f, fz = 0.0f;
-            for (u64 k = s; k < e; ++k) {
-              const u64 j = static_cast<u64>(neigh.at(k));
-              // Every entry LOOKED AT, matching or not. PASS B re-walks each
-              // atom's whole neighbour list once per touched position page and
-              // discards the entries belonging to other pages, so this counts
-              // the work actually done against the work that was useful.
-              ++n_scan;
-              if (AtomPage(x, j) != pg) continue;   // another hold's business
-              // Every neighbour entry belongs to EXACTLY ONE position page,
-              // so across all pg iterations this must count each entry once.
-              // Comparing the total against the host's sum(numneigh) turns
-              // "the energy is a bit low" into "N entries were never
-              // examined", which is the difference between guessing and
-              // knowing.
-              ++n_pairs;
-              const float delx = xtmp - xn.at(j * kPosStride + 0);
-              const float dely = ytmp - xn.at(j * kPosStride + 1);
-              const float delz = ztmp - xn.at(j * kPosStride + 2);
-              const int jtype = tn.at(j);
-              const float rsq = delx * delx + dely * dely + delz * delz;
-              const int c = itype * lj.ntypes_p1 + jtype;
-              if (itype == 0 || jtype == 0) ++n_badtype;
-              if (rsq >= lj.cutsq[c]) { ++n_cut; continue; }
-
-              const float r2inv = 1.0f / rsq;
-              const float r6inv = r2inv * r2inv * r2inv;
-              const float forcelj = r6inv * (lj.lj1[c] * r6inv - lj.lj2[c]);
-              const float fpair = forcelj * r2inv;
-              fx += delx * fpair;
-              fy += dely * fpair;
-              fz += delz * fpair;
-              if (eflag) {
-                // Half, because a full list visits every pair twice.
-                e_local += 0.5 * static_cast<double>(
-                    r6inv * (lj.lj3[c] * r6inv - lj.lj4[c]) - lj.offset[c]);
-              }
-              // Same halving, and for the same reason.
-              v_local[0] += 0.5 * static_cast<double>(delx * delx * fpair);
-              v_local[1] += 0.5 * static_cast<double>(dely * dely * fpair);
-              v_local[2] += 0.5 * static_cast<double>(delz * delz * fpair);
-              v_local[3] += 0.5 * static_cast<double>(delx * dely * fpair);
-              v_local[4] += 0.5 * static_cast<double>(delx * delz * fpair);
-              v_local[5] += 0.5 * static_cast<double>(dely * delz * fpair);
-            }
-            // Accumulate: this hold contributes only the pairs that fell in
-            // its page, and the other holds contribute the rest.
-            f[static_cast<u64>(i) * kPosStride + 0] += fx;
-            f[static_cast<u64>(i) * kPosStride + 1] += fy;
-            f[static_cast<u64>(i) * kPosStride + 2] += fz;
-          }
+          const long long _pb0 = clock64();
+          PairLJCutPageChunk(xn, tn, neigh, f, x, offset, ilist, tile_x, tile_t,
+                             lj, pg, e0, e1, t0, t1, eflag, &e_local, v_local,
+                             &n_pairs, &n_scan, &n_badtype, &n_cut);
+          if (threadIdx.x == 0) c_passb += (u64)(clock64() - _pb0);
           __syncthreads();
         }
       }
@@ -590,6 +625,10 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
   atomicAdd(&pairs_out[0], n_pairs);
   if (threadIdx.x == 0 || true) atomicAdd(&pairs_out[4], 0ull);
   atomicAdd(&pairs_out[3], n_scan);
+  if (threadIdx.x == 0) {
+    atomicAdd(&pairs_out[1], c_passb);
+    atomicAdd(&pairs_out[2], c_hold);
+  }
   atomicAdd(&pairs_out[1], n_badtype);
   atomicAdd(&pairs_out[2], n_cut);
 
