@@ -77,7 +77,21 @@ void PairLJCutEternia::settings(int narg, char **arg)
     } else if (strcmp(arg[iarg], "slots") == 0) {
       if (iarg + 2 > narg)
         utils::missing_cmd_args(FLERR, "pair_style lj/cut/eternia slots", error);
-      cfg.slots_x = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
+      // `slots` sets ALL FOUR vectors, not just positions. It previously set
+      // slots_x alone and left neigh at 4 and f at 8, so the neighbour list --
+      // by far the largest array, 45 MB of a 53 MB dataset at 62,500 atoms --
+      // thrashed a four-page cache no matter how large the total was made.
+      // Every one of those misses suspends the block, and a suspension costs a
+      // whole grid teardown and relaunch, which is what made this kernel slow.
+      //
+      // Positions need >= 3 (i-page, j-page, spare). The others are given the
+      // same budget rather than a fixed fraction: which vector dominates is a
+      // property of the system, not of the style.
+      const int sl = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
+      cfg.slots_x = sl;
+      cfg.slots_neigh = sl;
+      cfg.slots_f = sl;
+      cfg.slots_type = (sl < 4) ? sl : 4;   // types are one int per atom
       iarg += 2;
     } else if (strcmp(arg[iarg], "tag") == 0) {
       if (iarg + 2 > narg)
@@ -264,10 +278,10 @@ void PairLJCutEternia::report_stats()
   const eternia_lammps::Stats s = eternia_lammps::GetStats(ctx);
   if (comm->me == 0) {
     utils::logmesg(lmp,
-                   "eternia step {}: mask {} ago {} rounds {} kernel_ms {:.2f} [launch {:.1f} copy {:.1f} upl {:.1f}] | x faults {} evicts {} | neigh faults {} | "
+                   "eternia step {}: mask {} ago {} rounds {} kernel_ms {:.2f} [launch {:.1f} copy {:.1f} upl {:.1f}] scanned {} blaunch {} | x faults {} evicts {} | neigh faults {} | "
                    "f puts {} (errors {}) | get errors {} | pairs {}/{} badtype {} cut {}\n",
                    update->ntimestep, s.drop_mask, neighbor->ago, s.rounds, s.kernel_ms,
-                   s.t_launch_ms, s.t_copy_ms, s.t_upload_ms,
+                   s.t_launch_ms, s.t_copy_ms, s.t_upload_ms, s.entries_scanned, s.block_launches,
                    s.x_faults, s.x_evicts, s.neigh_faults,
                    s.f_puts, s.f_put_errors, s.get_errors, s.pairs_seen,
                    s.pairs_expected, s.pairs_badtype, s.pairs_cut);

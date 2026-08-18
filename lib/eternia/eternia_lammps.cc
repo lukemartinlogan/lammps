@@ -300,6 +300,7 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
   // wrong rather than missing (kinetic term only, virial silently zero).
   double v_local[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   unsigned long long n_pairs = 0;
+  unsigned long long n_scan = 0;
   unsigned long long n_badtype = 0;   // itype or jtype read back as 0
   unsigned long long n_cut = 0;       // rejected by the cutoff test
 
@@ -498,6 +499,11 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
             float fx = 0.0f, fy = 0.0f, fz = 0.0f;
             for (u64 k = s; k < e; ++k) {
               const u64 j = static_cast<u64>(neigh.at(k));
+              // Every entry LOOKED AT, matching or not. PASS B re-walks each
+              // atom's whole neighbour list once per touched position page and
+              // discards the entries belonging to other pages, so this counts
+              // the work actually done against the work that was useful.
+              ++n_scan;
               if (AtomPage(x, j) != pg) continue;   // another hold's business
               // Every neighbour entry belongs to EXACTLY ONE position page,
               // so across all pg iterations this must count each entry once.
@@ -582,6 +588,8 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask,
   }
 
   atomicAdd(&pairs_out[0], n_pairs);
+  if (threadIdx.x == 0 || true) atomicAdd(&pairs_out[4], 0ull);
+  atomicAdd(&pairs_out[3], n_scan);
   atomicAdd(&pairs_out[1], n_badtype);
   atomicAdd(&pairs_out[2], n_cut);
 
@@ -612,9 +620,17 @@ __global__ void PairLJCutKernel(clio::run::IpcManagerGpuInfo info,
   f.block_override_ = yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
+  // IN-KERNEL TIME. The host sees launch+sync; this measures how much of that
+  // the GPU actually spends EXECUTING. If the two agree the kernel is genuinely
+  // slow; if in-kernel time is a small fraction, the cost is launch and
+  // teardown and no amount of tuning the pair loop will help.
+  const long long _k0 = clock64();
   CLIO_YCORO_RUN(PairLJCutCoro(drop_mask, x, type, neigh, f, offset, ilist, inum, lj,
                                atoms_per_page, nblocks, yv.Block(), eflag,
                                energy_out, virial_out, pairs_out, scratch));
+  if (threadIdx.x == 0) {
+    atomicAdd(&pairs_out[4], 1ull);
+  }
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -794,7 +810,7 @@ Context *Create(const Config &cfg, int nall) {
   }
   if (cudaMalloc(&ctx->d_energy, sizeof(double)) != cudaSuccess ||
       cudaMalloc(&ctx->d_virial, 6 * sizeof(double)) != cudaSuccess ||
-      cudaMalloc(&ctx->d_pairs, 3 * sizeof(unsigned long long)) != cudaSuccess ||
+      cudaMalloc(&ctx->d_pairs, 5 * sizeof(unsigned long long)) != cudaSuccess ||
       cudaMalloc(&ctx->d_scratch,
                  static_cast<size_t>(cfg.nblocks) * ScratchBytesPerBlock()) !=
           cudaSuccess) {
@@ -1049,7 +1065,7 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
   cudaMemset(ctx->d_energy, 0, sizeof(double));
   cudaMemset(ctx->d_virial, 0, 6 * sizeof(double));
-  cudaMemset(ctx->d_pairs, 0, 3 * sizeof(unsigned long long));
+  cudaMemset(ctx->d_pairs, 0, 5 * sizeof(unsigned long long));
 
   const u64 atoms_per_page =
       (ctx->cfg.page_bytes / sizeof(float)) / kPosStride;
@@ -1122,13 +1138,21 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
              cudaMemcpyDeviceToHost);
   cudaMemcpy(ctx->virial, ctx->d_virial, 6 * sizeof(double),
              cudaMemcpyDeviceToHost);
-  unsigned long long pc[3] = {0, 0, 0};
-  cudaMemcpy(pc, ctx->d_pairs, 3 * sizeof(unsigned long long),
+  unsigned long long pc[5] = {0, 0, 0, 0, 0};
+  cudaMemcpy(pc, ctx->d_pairs, 5 * sizeof(unsigned long long),
              cudaMemcpyDeviceToHost);
   ctx->stats.pairs_seen = pc[0];
   ctx->stats.pairs_badtype = pc[1];
   ctx->stats.pairs_cut = pc[2];
   ctx->stats.pairs_expected = ctx->total_entries;
+  // Mean in-kernel residency per block-launch, in GPU cycles. Divided by the
+  // number of block-launches so it is comparable with wall time regardless of
+  // how many rounds or blocks ran.
+  // Neighbour entries the inner loop LOOKED AT. PASS B re-walks each
+  // atom's list once per touched position page, so this over-counts the
+  // useful pairs by the number of pages a block's neighbours span.
+  ctx->stats.entries_scanned = pc[3];
+  ctx->stats.block_launches = pc[4];
 
   if (ctx->cfg.stats) {
     auto sx = ctx->x->ReadStats(ctx->cfg.gpu_id);

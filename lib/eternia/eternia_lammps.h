@@ -83,6 +83,8 @@ struct Stats {
   double t_launch_ms = 0.0;
   double t_copy_ms = 0.0;
   double t_upload_ms = 0.0;
+  std::uint64_t entries_scanned = 0;
+  std::uint64_t block_launches = 0;
   double kernel_ms = 0.0;
 
   std::uint64_t x_faults = 0;
