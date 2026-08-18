@@ -120,11 +120,31 @@ constexpr u32 kTileAtoms = 512;
  * Global rather than shared because every one of these must survive a
  * co_await -- see the note at the top of PairLJCutCoro.
  */
+/**
+ * How many position pages the single-pass path can hold at once.
+ *
+ * The windowed path re-walks every atom's neighbour list ONCE PER TOUCHED
+ * PAGE and discards the entries belonging to other pages: measured 16.1M
+ * entries examined for 4.875M useful pairs at 62,500 atoms, and PASS A walks
+ * the list twice more on top. When the pages a block needs all fit in its
+ * cache at once, none of that is necessary -- hold them, remember where each
+ * landed, and make ONE pass with a table lookup instead of a filter.
+ *
+ * 32 pages is 8 MB of positions at a 256 KB page, far more than a block's
+ * neighbours span in a sorted system, and it must also stay under slots_x so
+ * holding the last page cannot evict the first.
+ */
+constexpr clio::run::u32 kMaxDirectPages = 32;
+
 CTP_INLINE_CROSS_FUN clio::run::u64 ScratchBytesPerBlock() {
   return static_cast<clio::run::u64>(kPageBitmapWords) * sizeof(clio::run::u32) +
          2 * sizeof(clio::run::u64) +
          static_cast<clio::run::u64>(kTileAtoms) * 3 * sizeof(float) +
-         static_cast<clio::run::u64>(kTileAtoms) * sizeof(int);
+         static_cast<clio::run::u64>(kTileAtoms) * sizeof(int) +
+         // Base pointers for the direct path: positions and types per page.
+         // Global, like everything else here, because they must survive the
+         // co_await that holding the next page can perform.
+         static_cast<clio::run::u64>(kMaxDirectPages) * 2 * sizeof(void *);
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -333,6 +353,91 @@ __device__ CTP_INLINE void PairLJCutPageChunk(
   }
 }
 
+
+/**
+ * ONE pass over the neighbour entries, with the position pages already held
+ * and their base pointers in a table.
+ *
+ * The windowed path this replaces re-walks every atom's list once per touched
+ * page and throws away the entries that belong elsewhere -- 16.1M entries
+ * examined for 4.875M useful pairs, plus two more full walks in PASS A to find
+ * the page range and build a bitmap. Here the page index picks a base pointer
+ * out of a table, so every entry is looked at exactly once and there is no
+ * filter at all.
+ */
+__device__ CTP_INLINE void PairLJCutDirect(
+    const float **xptr, const int **tptr, u64 pg_lo, u64 xpe,
+    gv::DeviceVector<int> neigh, gv::DeviceVector<float> f,
+    const gv::DeviceVector<float> &x,
+    const int *offset, const int *ilist, const float *tile_x,
+    const int *tile_t, const LJParams &lj, u64 e0, u64 e1, u64 t0, u64 t1,
+    int eflag, double *e_local, double *v_local,
+    unsigned long long *n_pairs, unsigned long long *n_scan,
+    unsigned long long *n_badtype, unsigned long long *n_cut) {
+  const int *npage = neigh.GetPagePtr();
+  if (npage == nullptr) return;
+  const u64 nbase = e0 - (e0 % neigh.h_->elems_per_page_);
+  const u64 apg = xpe / kPosStride;   // atoms per position page
+
+  for (u64 a = t0 + threadIdx.x; a < t1; a += blockDim.x) {
+    const int ii = static_cast<int>(a);
+    const int i = ilist[ii];
+    const u64 so = (a - t0) * 3;
+    const float xtmp = tile_x[so + 0];
+    const float ytmp = tile_x[so + 1];
+    const float ztmp = tile_x[so + 2];
+    const int itype = tile_t[a - t0];
+
+    u64 sK = static_cast<u64>(offset[ii]);
+    u64 eK = static_cast<u64>(offset[ii + 1]);
+    if (sK < e0) sK = e0;
+    if (eK > e1) eK = e1;
+
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    for (u64 k = sK; k < eK; ++k) {
+      const u64 j = static_cast<u64>(npage[k - nbase]);
+      ++(*n_scan);
+      const u64 pgj = AtomPage(x, j);
+      const u64 slot = pgj - pg_lo;
+      if (slot >= kMaxDirectPages) continue;
+      const float *xp = xptr[slot];
+      const int *tp = tptr[slot];
+      if (xp == nullptr || tp == nullptr) continue;
+      ++(*n_pairs);
+      const u64 jx = j * kPosStride - pgj * xpe;
+      const float delx = xtmp - xp[jx + 0];
+      const float dely = ytmp - xp[jx + 1];
+      const float delz = ztmp - xp[jx + 2];
+      const int jtype = tp[j - pgj * apg];
+      const float rsq = delx * delx + dely * dely + delz * delz;
+      const int c = itype * lj.ntypes_p1 + jtype;
+      if (itype == 0 || jtype == 0) ++(*n_badtype);
+      if (rsq >= lj.cutsq[c]) { ++(*n_cut); continue; }
+
+      const float r2inv = 1.0f / rsq;
+      const float r6inv = r2inv * r2inv * r2inv;
+      const float forcelj = r6inv * (lj.lj1[c] * r6inv - lj.lj2[c]);
+      const float fpair = forcelj * r2inv;
+      fx += delx * fpair;
+      fy += dely * fpair;
+      fz += delz * fpair;
+      if (eflag) {
+        *e_local += 0.5 * static_cast<double>(
+            r6inv * (lj.lj3[c] * r6inv - lj.lj4[c]) - lj.offset[c]);
+      }
+      v_local[0] += 0.5 * static_cast<double>(delx * delx * fpair);
+      v_local[1] += 0.5 * static_cast<double>(dely * dely * fpair);
+      v_local[2] += 0.5 * static_cast<double>(delz * delz * fpair);
+      v_local[3] += 0.5 * static_cast<double>(delx * dely * fpair);
+      v_local[4] += 0.5 * static_cast<double>(delx * delz * fpair);
+      v_local[5] += 0.5 * static_cast<double>(dely * delz * fpair);
+    }
+    f[static_cast<u64>(i) * kPosStride + 0] += fx;
+    f[static_cast<u64>(i) * kPosStride + 1] += fy;
+    f[static_cast<u64>(i) * kPosStride + 2] += fz;
+  }
+}
+
 /** Wait out this block's outstanding writebacks by PARKING, not spinning. */
 __device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float> &v) {
   CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
@@ -392,6 +497,9 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask, int loop_level,
   u64 *range = reinterpret_cast<u64 *>(touched + kPageBitmapWords);
   float *tile_x = reinterpret_cast<float *>(range + 2);
   int *tile_t = reinterpret_cast<int *>(tile_x + 3 * kTileAtoms);
+  // Page base pointers for the single-pass path (see kMaxDirectPages).
+  const float **xptr = reinterpret_cast<const float **>(tile_t + kTileAtoms);
+  const int **tptr = reinterpret_cast<const int **>(xptr + kMaxDirectPages);
 
   u64 run = 0;
   double e_local = 0.0;
@@ -559,6 +667,41 @@ __device__ gy::YCoroMain PairLJCutCoro(clio::run::u32 drop_mask, int loop_level,
 
       const u64 pg_lo = range[0], pg_hi = range[1];
       if (pg_lo == ~0ull) continue;   // no entries fell to this thread set
+
+      // DIRECT PATH: when every position page this chunk touches fits in the
+      // cache at once, hold them all, remember where each landed, and make a
+      // single pass. The windowed path below re-walks the whole neighbour list
+      // once per touched page and filters -- correct, but it examined 16.1M
+      // entries to do 4.875M pairs.
+      if (pg_hi - pg_lo + 1 <= kMaxDirectPages) {
+        for (u64 pg = pg_lo; pg <= pg_hi; ++pg) {
+          gv::DeviceVector<float> xd2 = x;
+          gv::DeviceVector<int> td2 = type;
+          const u64 xpe2 = x.h_->elems_per_page_;
+          run = xd2.TryHoldFast(pg * xpe2, xpe2);
+          if (run == 0) {
+            co_await xd2.HoldPageCoro(pg * xpe2, xpe2, &run);
+          }
+          run = td2.TryHoldFast(pg * xpe2 / kPosStride, xpe2 / kPosStride);
+          if (run == 0) {
+            co_await td2.HoldPageCoro(pg * xpe2 / kPosStride,
+                                      xpe2 / kPosStride, &run);
+          }
+          if (threadIdx.x == 0) {
+            xptr[pg - pg_lo] = xd2.GetPagePtr();
+            tptr[pg - pg_lo] = td2.GetPagePtr();
+          }
+          __syncthreads();
+        }
+        const long long _pd0 = clock64();
+        PairLJCutDirect(xptr, tptr, pg_lo, x.h_->elems_per_page_, neigh, f, x,
+                        offset, ilist, tile_x, tile_t, lj, e0, e1, t0, t1,
+                        eflag, &e_local, v_local, &n_pairs, &n_scan,
+                        &n_badtype, &n_cut);
+        if (threadIdx.x == 0) c_passb += (u64)(clock64() - _pd0);
+        __syncthreads();
+        continue;   // this neighbour page is done
+      }
 
       // Windowed, because the bitmap is a fixed 2048 pages: entries spanning
       // more than that (unsorted atoms) are processed in several windows
