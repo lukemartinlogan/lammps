@@ -625,6 +625,7 @@ class YieldRunner {
       : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
+    drv_.ResetTimers();
     drv_.Reset();
     stack_.Reset();
     return drv_.RunToCompletion(
@@ -633,6 +634,12 @@ class YieldRunner {
         },
         [] {}, /*max_rounds=*/2000000);
   }
+
+ private:
+ public:
+  double KernelMs() const { return drv_.KernelMs(); }
+  double CopyMs() const { return drv_.CopyMs(); }
+  double UploadMs() const { return drv_.UploadMs(); }
 
  private:
   gy::Yieldable<> drv_;
@@ -1096,6 +1103,9 @@ bool ComputeLJCut(Context *ctx, int eflag, int newton_pair) {
   ctx->x_dirty = false;
   ctx->type_dirty = false;
   ctx->neigh_dirty = false;
+  ctx->stats.t_launch_ms = runner.KernelMs();
+  ctx->stats.t_copy_ms = runner.CopyMs();
+  ctx->stats.t_upload_ms = runner.UploadMs();
   ctx->stats.drop_mask = drop_mask;
   ctx->stats.rounds = rounds;
   ctx->stats.kernel_ms =

@@ -80,6 +80,9 @@ struct Stats {
    *  is fast, and it was not being reported at all. */
   std::uint64_t rounds = 0;
   std::uint32_t drop_mask = 0;
+  double t_launch_ms = 0.0;
+  double t_copy_ms = 0.0;
+  double t_upload_ms = 0.0;
   double kernel_ms = 0.0;
 
   std::uint64_t x_faults = 0;
